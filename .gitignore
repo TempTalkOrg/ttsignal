@@ -39,3 +39,16 @@ package-lock.json
 **/*.dir
 CMakeCache.txt
 /android/build/
+/data/
+/node_modules/
+Makefile
+cmake_install.cmake
+/js/
+.cache/
+compile_commands.json
+.clangd
+.ninja_log
+.ninja_deps
+build.ninja
+*.exp
+*.lib

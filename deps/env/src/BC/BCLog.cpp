@@ -45,7 +45,7 @@ LogWarn(const char * szFileName, uint32_t nLineNO,
 {
 	va_list args;
 	va_start(args, szFmtStr);
-	vlog(NULL, _WARNING_, szFileName, nLineNO, szFuncName, szFmtStr, args);
+	vlog(NULL, _WARN_, szFileName, nLineNO, szFuncName, szFmtStr, args);
 	va_end(args);
 }
 void
@@ -119,7 +119,7 @@ LogWarn(const void* logger_ctx, const char * szFileName, uint32_t nLineNO,
 {
 	va_list args;
 	va_start(args, szFmtStr);
-	vlog(logger_ctx, _WARNING_, szFileName, nLineNO, szFuncName, szFmtStr, args);
+	vlog(logger_ctx, _WARN_, szFileName, nLineNO, szFuncName, szFmtStr, args);
 	va_end(args);
 }
 void
@@ -171,16 +171,16 @@ LogAssert(const void* logger_ctx, const char * szFileName, uint32_t nLineNO,
 }
 
 void
-LogCustom(const void *logger_ctx, const char* szFmtStr, ...)
+LogCustom(const void *logger_ctx, int32_t nLevel, const char* szFmtStr, ...)
 {
 	va_list args;
 	va_start(args, szFmtStr);
-	BCLogger::GetInstance()->Log(logger_ctx, szFmtStr, args);
+	BCLogger::GetInstance()->Log(logger_ctx, nLevel, szFmtStr, args);
 	va_end(args);
 }
 
 void
-LogCustomWithTime(const void *logger_ctx, const char* szFmtStr, ...)
+LogCustomWithTime(const void *logger_ctx, int32_t nLevel, const char* szFmtStr, ...)
 {
 	char timestr[50] = { 0 };
 	BCLogBase::GetTime(timestr, sizeof(timestr));
@@ -188,7 +188,7 @@ LogCustomWithTime(const void *logger_ctx, const char* szFmtStr, ...)
 	strFmt.Format("[%s]%s", timestr, szFmtStr);
 	va_list args;
 	va_start(args, szFmtStr);
-	BCLogger::GetInstance()->Log(logger_ctx, strFmt.c_str(), args);
+	BCLogger::GetInstance()->Log(logger_ctx, nLevel, strFmt.c_str(), args);
 	va_end(args);
 }
 void
@@ -237,7 +237,7 @@ void
 LogWarnV(const char * szFileName, uint32_t nLineNO,
 		 const char * szFuncName, const char * szFmtStr, va_list args)
 {
-	vlog(NULL, _WARNING_, szFileName, nLineNO, szFuncName, szFmtStr, args);
+	vlog(NULL, _WARN_, szFileName, nLineNO, szFuncName, szFmtStr, args);
 }
 void
 LogInfoV(const char * szFileName, uint32_t nLineNO,
@@ -288,7 +288,7 @@ void
 LogWarnV(const void* logger_ctx, const char * szFileName, uint32_t nLineNO,
 		 const char * szFuncName, const char * szFmtStr, va_list args)
 {
-	vlog(logger_ctx, _WARNING_, szFileName, nLineNO, szFuncName, szFmtStr, args);
+	vlog(logger_ctx, _WARN_, szFileName, nLineNO, szFuncName, szFmtStr, args);
 }
 void
 LogInfoV(const void* logger_ctx, const char * szFileName, uint32_t nLineNO,
@@ -324,9 +324,9 @@ LogAssertV(const void* logger_ctx, const char * szFileName, uint32_t nLineNO,
 }
 
 void
-LogCustomV(const void *logger_ctx, const char* szFmtStr, va_list args)
+LogCustomV(const void *logger_ctx, int32_t nLevel, const char* szFmtStr, va_list args)
 {
-	BCLogger::GetInstance()->Log(logger_ctx, szFmtStr, args);
+	BCLogger::GetInstance()->Log(logger_ctx, nLevel, szFmtStr, args);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -437,6 +437,7 @@ void BCLogger::Log(
 
 void BCLogger::Log(
 	const void* logger_ctx,
+	int32_t nLevel,
 	LPCSTR szFMT, 
 	va_list args)
 {
@@ -448,7 +449,7 @@ void BCLogger::Log(
 		BCSpinMutex::Owner lock(s_lock);
 		if (logger_ctx)
 		{
-			((BCLogBase*)logger_ctx)->Log(fmtStr);
+			((BCLogBase*)logger_ctx)->Log(nLevel, fmtStr);
 		}
 		else
 		{
@@ -456,7 +457,7 @@ void BCLogger::Log(
 			{
 				if (!iter->m_bExclusive)
 				{
-					iter->Log(fmtStr);
+					iter->Log(nLevel, fmtStr);
 				}
 			}
 		}
@@ -710,12 +711,15 @@ void BCLogFile::Log(
 	PostEvent(sEvent);
 }
 
-void BCLogFile::Log(LPCSTR szMsg)
+void BCLogFile::Log(int32_t nLevel, LPCSTR szMsg)
 {
-	BCEventItemS sEvent(MAKEEVENT(LOGF_MSG_LOG_CUSTOM, 0, 0));
-	sEvent.wParam = (uint64_t)sEvent.CopyString(szMsg);
-	sEvent.vParams[7] = bc_time_now();
-	PostEvent(sEvent);
+	if (m_nLevel >= 0 && nLevel <= m_nLevel)
+	{
+		BCEventItemS sEvent(MAKEEVENT(LOGF_MSG_LOG_CUSTOM, 0, 0), nLevel);
+		sEvent.lParam = (uint64_t)sEvent.CopyString(szMsg);
+		sEvent.vParams[7] = bc_time_now();
+		PostEvent(sEvent);
+	}
 }
 
 void BCLogFile::LogBinary(
@@ -879,20 +883,13 @@ static int bc_log_level_to_android_level(int level)
 	int androidLevel = 0;
 	switch(level)
 	{
-#define _FATAL_		0
-#define _ERROR_		1
-#define _WARNING_	2
-#define _INFO_		3
-#define _DEBUG_		4
-#define _FINE_		5
-#define _FINEST_	6
 	case _FATAL_:
 		androidLevel = ANDROID_LOG_FATAL;
 		break;
 	case _ERROR_:
 		androidLevel = ANDROID_LOG_ERROR;
 		break;
-	case _WARNING_:
+	case _WARN_:
 		androidLevel = ANDROID_LOG_WARN;
 		break;
 	case _INFO_:
@@ -937,7 +934,7 @@ void BCLogFile::LogInternal(
 	__android_log_print(androidLevel, "BCLog", "[%s][%s:%d]:%s", timestr,
 		szFileName, nLineNumber, szMsg);
 }
-void BCLogFile::LogInternal(LPCSTR szMsg)
+void BCLogFile::LogInternal(int32_t level, LPCSTR szMsg)
 {
 	int androidLevel = bc_log_level_to_android_level(_INFO_);
 	__android_log_print(androidLevel, "BCLog", "%s", szMsg);
@@ -961,20 +958,13 @@ void BCLogFile::LogInternal(
 	}
 	switch(nLevel)
 	{
-#define _FATAL_		0
-#define _ERROR_		1
-#define _WARNING_	2
-#define _INFO_		3
-#define _DEBUG_		4
-#define _FINE_		5
-#define _FINEST_	6
 	case _FATAL_:
 		snprintf(typestr, 50, "fatal");
 		break;
 	case _ERROR_:
 		snprintf(typestr, 50, "error");
 		break;
-	case _WARNING_:
+	case _WARN_:
 		snprintf(typestr, 50, "warn");
 		break;
 	case _INFO_:
@@ -1009,8 +999,12 @@ void BCLogFile::LogInternal(
 //#endif
 	m_bPrintPrefix = strstr(szMsg, "\n") != NULL;
 }
-void BCLogFile::LogInternal(LPCSTR szMsg)
+void BCLogFile::LogInternal(int32_t nLevel, LPCSTR szMsg)
 {
+	if (m_nLevel < 0 || nLevel > m_nLevel)
+	{
+		return;
+	}
 	fseek(m_pLogFile, 0, SEEK_END);
 	if (m_bPrintPrefix)
 	{
@@ -1130,7 +1124,7 @@ bool BCLogFile::OnEventProcess(BCEventItemS& refEvent)
 			(LPCSTR)refEvent.vParams[2]);
 		break;
 	case LOGF_MSG_LOG_CUSTOM:
-		LogInternal((LPCSTR)refEvent.wParam);
+		LogInternal(refEvent.wParam, (LPCSTR)refEvent.lParam);
 		break;
 	case LOGF_MSG_BIN:
 		LogBinaryInternal((LPCSTR)refEvent.vParams[0], refEvent.wParam, 
@@ -1215,20 +1209,13 @@ void BCLogExternal::Log(
 	}
 	switch(nLevel)
 	{
-#define _FATAL_		0
-#define _ERROR_		1
-#define _WARNING_	2
-#define _INFO_		3
-#define _DEBUG_		4
-#define _FINE_		5
-#define _FINEST_	6
 	case _FATAL_:
 		snprintf(typestr, 50, "fatal error!");
 		break;
 	case _ERROR_:
 		snprintf(typestr, 50, "error!");
 		break;
-	case _WARNING_:
+	case _WARN_:
 		snprintf(typestr, 50, "warning!");
 		break;
 	case _INFO_:
@@ -1259,14 +1246,18 @@ end:
 	m_sLock.Unlock();
 }
 
-void BCLogExternal::Log(LPCSTR szMsg)
+void BCLogExternal::Log(int32_t nLevel, LPCSTR szMsg)
 {
-
 	m_sLock.Lock();
+	if (m_nLevel < 0 || nLevel > m_nLevel)
+	{
+		goto end;
+	}
 	if (m_lpfnCallback)
 	{
-		(*m_lpfnCallback)(m_pData, 0, szMsg);
+		(*m_lpfnCallback)(m_pData, nLevel, szMsg);
 	}
+end:
 	m_sLock.Unlock();
 }
 

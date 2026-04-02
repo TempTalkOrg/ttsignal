@@ -35,6 +35,9 @@ SMPacket::SMPacket()
 	: type(0)
 	, timestamp(0)
 	, trans_id(0)
+	, stream_id(0)
+	, origion_data(NULL)
+	, packed_jmp_data(NULL)
 {
 }
 

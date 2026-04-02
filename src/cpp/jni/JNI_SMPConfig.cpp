@@ -67,6 +67,12 @@ BCFObject *SMPConfig::ConvertFromJava(JNIEnv *env, jobject obj)
 		JniUtils::GetBooleanField(env, obj, cls, "pingOn"));
 	pConfig->PutInt("ping_interval",
 		JniUtils::GetIntField(env, obj, cls, "pingInterval"));
+	pConfig->PutInt("active_connection_id_limit",
+		JniUtils::GetIntField(env, obj, cls, "activeConnectionIdLimit"));
+	pConfig->PutInt("device_type",
+		JniUtils::GetIntField(env, obj, cls, "deviceType"));
+	pConfig->PutString("cid_tag",
+		JniUtils::GetStringField(env, obj, cls, "cidTag", strValue));
 	// SSL
 	pConfig->PutBool("ssl",
 		JniUtils::GetBooleanField(env, obj, cls, "ssl"));
@@ -80,6 +86,8 @@ BCFObject *SMPConfig::ConvertFromJava(JNIEnv *env, jobject obj)
     }
 	pConfig->PutInt("log_level",
 		JniUtils::GetIntField(env, obj, cls, "logLevel"));
+		pConfig->PutInt("num_of_senders",
+			JniUtils::GetIntField(env, obj, cls, "numOfSenders"));
 	env->DeleteLocalRef(cls);
 	return pConfig;
 }

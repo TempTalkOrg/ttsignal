@@ -19,6 +19,11 @@ endif()
 
 set(BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
+add_custom_target(touch_utils ALL
+    COMMAND ${CMAKE_COMMAND} -E touch "${BASE_DIR}/cpp/Utils.cpp"
+    COMMENT "Touching Utils.cpp to update build timestamp"
+)
+
 add_subdirectory(${BASE_DIR}/../deps/env/src deps/env.dir)
 add_subdirectory(${BASE_DIR}/../deps/boringssl/src deps/boringssl.dir)
 add_subdirectory(${BASE_DIR}/../deps/jquic deps/jquic.dir)
@@ -30,36 +35,99 @@ add_definitions(-D__STDC_LIMIT_MACROS -DHAVE_PTHREAD -DCR_USE_FALLBACKS_FOR_GCC_
         -DXQC_ENABLE_UNLIMITED
         -DXQC_ENABLE_COPA)
 
-add_compile_options(-fPIC)
 
 set(CMAKE_CXX_STANDARD 20)
 
-if (CMAKE_BUILD_TYPE MATCHES "Debug")
-	SET(LIB_NAME ttsignal )
-	SET(CMAKE_C_FLAGS_DEBUG "-g -Wall")
-	SET(CMAKE_CXX_FLAGS_DEBUG "-g -Wall")
-        add_definitions(-D_DEBUG -DDEBUG)
-        add_compile_options(-Wno-deprecated-declarations)
-        add_compile_options(-Wno-unused-label)
-        add_compile_options(-Wno-unused-parameter)
-        add_compile_options(-Wno-unused-result)
-        add_compile_options(-Wno-unused-variable)
-        add_compile_options(-Wno-unused-but-set-variable)
-        add_compile_options(-Wno-conversion-null)
+
+if(MSVC)
+    set(MSVC_DISABLED_WARNINGS_LIST
+        "C4061" # enumerator 'identifier' in switch of enum 'enumeration' is not
+                # explicitly handled by a case label
+                # Disable this because it flags even when there is a default.
+        "C4100" # 'exarg' : unreferenced formal parameter
+        "C4127" # conditional expression is constant
+        "C4200" # nonstandard extension used : zero-sized array in
+                # struct/union.
+        "C4204" # nonstandard extension used: non-constant aggregate initializer
+        "C4221" # nonstandard extension used : 'identifier' : cannot be
+                # initialized using address of automatic variable
+        "C4242" # 'function' : conversion from 'int' to 'uint8_t',
+                # possible loss of data
+        "C4244" # 'function' : conversion from 'int' to 'uint8_t',
+                # possible loss of data
+        "C4267" # conversion from 'size_t' to 'int', possible loss of data
+        "C4371" # layout of class may have changed from a previous version of the
+                # compiler due to better packing of member '...'
+        "C4388" # signed/unsigned mismatch
+        "C4296" # '>=' : expression is always true
+        "C4350" # behavior change: 'std::_Wrap_alloc...'
+        "C4365" # '=' : conversion from 'size_t' to 'int',
+                # signed/unsigned mismatch
+        "C4389" # '!=' : signed/unsigned mismatch
+        "C4464" # relative include path contains '..'
+        "C4510" # 'argument' : default constructor could not be generated
+        "C4512" # 'argument' : assignment operator could not be generated
+        "C4514" # 'function': unreferenced inline function has been removed
+        "C4548" # expression before comma has no effect; expected expression with
+                # side-effect" caused by FD_* macros.
+        "C4610" # struct 'argument' can never be instantiated - user defined
+                # constructor required.
+        "C4623" # default constructor was implicitly defined as deleted
+        "C4625" # copy constructor could not be generated because a base class
+                # copy constructor is inaccessible or deleted
+        "C4626" # assignment operator could not be generated because a base class
+                # assignment operator is inaccessible or deleted
+        "C4628" # digraphs not supported with -Ze
+        "C4668" # 'symbol' is not defined as a preprocessor macro, replacing with
+                # '0' for 'directives'
+                # Disable this because GTest uses it everywhere.
+        "C4706" # assignment within conditional expression
+        "C4710" # 'function': function not inlined
+        "C4711" # function 'function' selected for inline expansion
+        "C4800" # 'int' : forcing value to bool 'true' or 'false'
+                # (performance warning)
+        "C4820" # 'bytes' bytes padding added after construct 'member_name'
+        "C5026" # move constructor was implicitly defined as deleted
+        "C5027" # move assignment operator was implicitly defined as deleted
+        "C5045" # Compiler will insert Spectre mitigation for memory load if
+                # /Qspectre switch specified
+    )
+    set(MSVC_LEVEL4_WARNINGS_LIST
+        # See https://connect.microsoft.com/VisualStudio/feedback/details/1217660/warning-c4265-when-using-functional-header
+        "C4265" # class has virtual functions, but destructor is not virtual
+    )
+    string(REPLACE "C" " -wd" MSVC_DISABLED_WARNINGS_STR
+                            ${MSVC_DISABLED_WARNINGS_LIST})
+    string(REPLACE "C" " -w4" MSVC_LEVEL4_WARNINGS_STR
+                            ${MSVC_LEVEL4_WARNINGS_LIST})
+    set(CMAKE_C_FLAGS   "-utf-8 -EHsc ${MSVC_DISABLED_WARNINGS_STR} ${MSVC_LEVEL4_WARNINGS_STR}")
+    set(CMAKE_CXX_FLAGS "-utf-8 -EHsc ${MSVC_DISABLED_WARNINGS_STR} ${MSVC_LEVEL4_WARNINGS_STR}")
+    add_compile_options(/wd5039 /wd5204)
 else()
-	SET(LIB_NAME ttsignal )
-	SET(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
-	SET(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
-        add_compile_options(-Wno-deprecated-declarations)
-        add_compile_options(-Wno-unused-label)
-        add_compile_options(-Wno-unused-parameter)
-        add_compile_options(-Wno-unused-result)
-        add_compile_options(-Wno-unused-variable)
-        add_compile_options(-Wno-unused-but-set-variable)
-        add_compile_options(-Wno-conversion-null)
+    add_compile_options(-fPIC)
+    add_compile_options(-Wno-deprecated-declarations)
+    add_compile_options(-Wno-unused-label)
+    add_compile_options(-Wno-unused-parameter)
+    add_compile_options(-Wno-unused-result)
+    add_compile_options(-Wno-unused-variable)
+    add_compile_options(-Wno-unused-but-set-variable)
+    add_compile_options(-Wno-conversion-null)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
 endif()
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
+SET(LIB_NAME ttsignal )
+if(MSVC)
+    SET(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} /D_DEBUG /DDEBUG")
+    SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /D_DEBUG /DDEBUG")
+    SET(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /O2 /DNDEBUG")
+    SET(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /DNDEBUG")
+else()
+    SET(CMAKE_C_FLAGS_DEBUG "-g -Wall -D_DEBUG -DDEBUG")
+    SET(CMAKE_CXX_FLAGS_DEBUG "-g -Wall -D_DEBUG -DDEBUG")
+    SET(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
+    SET(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
+endif()
+
 
 # 添加普通 C++ 头文件路径到包含目录
 include_directories(
@@ -155,8 +223,11 @@ if (BUILD_NODE_ADDON)
             set(DELAYLOAD_LIBS "-ldelayimp")
         else()
             # MSVC 延迟加载设置
-            set(EXTRA_LINK_FLAGS "-DELAYLOAD:node.exe")
-            set(DELAYLOAD_LIBS "-lDelayimp")
+            set(EXTRA_LINK_FLAGS
+                "${BASE_DIR}/../deps/node-v23.6.0/win/x64/node.lib"
+                ws2_32.lib Dbghelp.lib Shlwapi.lib Delayimp.lib
+            )
+            set(MSVC_DELAYLOAD_OPTIONS "/DELAYLOAD:node.exe")
         endif()
     endif()
 
@@ -171,6 +242,8 @@ if (BUILD_NODE_ADDON)
         )
     endif()
 
+    add_dependencies(${LIB_NAME} touch_utils)
+
     # 确保链接顺序正确
     target_link_libraries( 
         ${LIB_NAME} 
@@ -179,10 +252,15 @@ if (BUILD_NODE_ADDON)
         jquic
         ssl
         crypto
-        pthread
         ${CMAKE_DL_LIBS}
         ${EXTRA_LINK_FLAGS}
     )
+    if(NOT WIN32)
+        target_link_libraries(${LIB_NAME} PRIVATE pthread)
+    endif()
+    if(MSVC AND MSVC_DELAYLOAD_OPTIONS)
+        target_link_options(${LIB_NAME} PRIVATE ${MSVC_DELAYLOAD_OPTIONS})
+    endif()
 
     set_target_properties(${LIB_NAME} PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY_DEBUG ${BASE_DIR}/../node_modules/ttsignal/${CMAKE_BUILD_TYPE}
@@ -242,6 +320,8 @@ if (BUILD_JNI)
             LIBRARY_OUTPUT_DIRECTORY_RELEASE ${BASE_DIR}/../out/${CMAKE_SYSTEM_NAME}/${CMAKE_BUILD_TYPE}
         )
     endif()
+    add_dependencies(${LIB_NAME}jni touch_utils)
+
     target_link_libraries( 
         ${LIB_NAME}jni 
         PRIVATE

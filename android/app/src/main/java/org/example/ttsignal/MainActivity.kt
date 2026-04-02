@@ -104,6 +104,8 @@ class MainActivity : AppCompatActivity() {
         config.congestCtrl = Const.CC_BBR2
         config.pingOn = true
         config.alpn = "ttsignal"
+        config.deviceType = 1
+        config.cidTag = "12345678900"
 
         val charset = Charset.forName("UTF-8")
         connection?.close()

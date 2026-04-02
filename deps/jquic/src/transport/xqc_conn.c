@@ -885,7 +885,7 @@ xqc_conn_server_create(xqc_engine_t *engine, const struct sockaddr *local_addr,
         || new_scid.cid_len != engine->config->cid_len) 
     {
         /* server generates it's own cid */
-        if (xqc_generate_cid(engine, scid, &new_scid, 0) != XQC_OK) {
+        if (xqc_generate_cid(engine, scid, &new_scid, 0, user_data) != XQC_OK) {
             xqc_log(engine->log, XQC_LOG_ERROR, "|fail to generate_cid|");
             return NULL;
         }
@@ -1881,6 +1881,9 @@ xqc_need_padding(xqc_connection_t *conn, xqc_packet_out_t *packet_out)
                 ret = XQC_TRUE;
             }
         }
+
+    } else if (packet_out->po_pkt.pkt_pns == XQC_PNS_HSK) {
+        ret = XQC_TRUE;
 
     } else if ((packet_out->po_frame_types & XQC_FRAME_BIT_PATH_CHALLENGE)
                || (packet_out->po_frame_types & XQC_FRAME_BIT_PATH_RESPONSE)

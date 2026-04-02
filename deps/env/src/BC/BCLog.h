@@ -21,7 +21,7 @@ namespace BC
 
 #define _FATAL_		0
 #define _ERROR_		1
-#define _WARNING_	2
+#define _WARN_		2
 #define _INFO_		3
 #define _DEBUG_		4
 #define _FINE_		5
@@ -78,9 +78,9 @@ BC_API void
 LogAssert(const void* logger_ctx, const char * szFileName, uint32_t nLineNO,
           const char * szFuncName, const char * szFmtStr, ...);
 BC_API void
-LogCustom(const void* logger_ctx, const char * szFmtStr, ...);
+LogCustom(const void* logger_ctx, int32_t nLevel, const char * szFmtStr, ...);
 BC_API void
-LogCustomWithTime(const void* logger_ctx, const char * szFmtStr, ...);
+LogCustomWithTime(const void* logger_ctx, int32_t nLevel, const char * szFmtStr, ...);
 BC_API void
 LogBin(const char * szFileName, uint32_t nLineNO,
        const char * szFuncName, const void *pData, uint32_t dataLen);
@@ -144,7 +144,7 @@ BC_API void
 LogAssertV(const void* logger_ctx, const char * szFileName, uint32_t nLineNO,
            const char * szFuncName, const char * szFmtStr, va_list args);
 BC_API void
-LogCustomV(const void *logger_ctx, const char* szFmtStr, va_list args);
+LogCustomV(const void *logger_ctx, int32_t nLevel, const char* szFmtStr, va_list args);
 
 #define NYI LogWarn(_LOCAL_, "%s not yet implemented",__func__);
 #define NYIR NYI;return false;
@@ -209,6 +209,7 @@ public:
 							va_list args);
 	void				Log(
 							const void *logger_ctx, 
+							int32_t level,
 							LPCSTR szFMT, 
 							va_list args);
 	void				LogBinary(
@@ -260,7 +261,9 @@ public:
 							uint32_t nLineNumber,
 							LPCSTR szFuncName,
 							LPCSTR szMsg)			= 0;
-	virtual void		Log(LPCSTR szMsg)			= 0;
+	virtual void		Log(
+							int32_t nLevel, 
+							LPCSTR szMsg)			= 0;
 	virtual void		LogBinary(
 							LPCSTR szFileName,
 							uint32_t nLineNumber,
@@ -303,7 +306,7 @@ public:
 							uint32_t nLineNumber,
 							LPCSTR szFuncName,
 							LPCSTR szMsg);
-	virtual void		Log(LPCSTR szMsg);
+	virtual void		Log(int32_t nLevel, LPCSTR szMsg);
 	virtual void		LogBinary(
 							LPCSTR szFileName,
 							uint32_t nLineNumber,
@@ -327,7 +330,7 @@ protected:
 							uint32_t nLineNumber,
 							LPCSTR szFuncName,
 							LPCSTR szMsg);
-	void				LogInternal(LPCSTR szMsg);
+	void				LogInternal(int32_t nLevel, LPCSTR szMsg);
 	void				LogBinaryInternal(
 							LPCSTR szFileName,
 							uint32_t nLineNumber,
@@ -372,7 +375,7 @@ public:
 							uint32_t nLineNumber,
 							LPCSTR szFuncName,
 							LPCSTR szMsg);
-	virtual void		Log(LPCSTR szMsg);
+	virtual void		Log(int32_t nLevel, LPCSTR szMsg);
 	virtual void		LogBinary(
 							LPCSTR szFileName,
 							uint32_t nLineNumber,

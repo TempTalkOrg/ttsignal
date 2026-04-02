@@ -896,6 +896,13 @@ end:
 void
 jqc_conn_main_logic(xqc_connection_t* conn)
 {
+    if (conn == NULL) {
+        return;
+    }
+    /* guard use-after-free: conn may be dangling after destroy, log/engine zeroed */
+    if (conn->log == NULL || conn->engine == NULL) {
+        return;
+    }
     if (conn->conn_flag & XQC_CONN_FLAG_RUNNING) {
         xqc_log(conn->log, XQC_LOG_DEBUG, "|conn is running|");
         return;
@@ -912,10 +919,11 @@ jqc_conn_main_logic(xqc_connection_t* conn)
     if (XQC_UNLIKELY(conn->conn_state == XQC_CONN_STATE_CLOSED)) {
         conn->conn_flag &= ~XQC_CONN_FLAG_TICKING;
         if (!(conn->conn_flag & XQC_CONN_FLAG_NO_DESTROY)) {
-            xqc_log(conn->log, XQC_LOG_INFO, "|destroy conn from conns_active_pq while closed|"
+            xqc_log(conn->log, XQC_LOG_INFO, "|destroy conn while closed|"
                     "conn:%p|%s", conn, xqc_conn_addr_str(conn));
             xqc_conn_destroy(conn);
-
+            /* conn is destroyed; must not use it (quit would touch conn->conn_flag, conn->log) */
+            return;
         } else {
             jqc_timer_next_tick(&conn->timer_cbs);
             conn->conn_flag |= XQC_CONN_FLAG_WAIT_WAKEUP;
@@ -952,7 +960,8 @@ jqc_conn_main_logic(xqc_connection_t* conn)
                         "conn:%p|%s", conn, xqc_conn_addr_str(conn));
 
                 xqc_conn_destroy(conn);
-
+                /* conn is destroyed; must not use it */
+                return;
             } else {
                 jqc_timer_next_tick(&conn->timer_cbs);
                 conn->conn_flag |= XQC_CONN_FLAG_WAIT_WAKEUP;
@@ -972,7 +981,8 @@ jqc_conn_main_logic(xqc_connection_t* conn)
                 xqc_log(conn->log, XQC_LOG_ERROR, "|destroy unexpected conn with tick timer unset|");
 
                 xqc_conn_destroy(conn);
-
+                /* conn is destroyed; must not use it */
+                return;
             } else {
                 jqc_timer_next_tick(&conn->timer_cbs);
                 conn->conn_flag |= XQC_CONN_FLAG_WAIT_WAKEUP;
@@ -997,6 +1007,9 @@ quit:
 
 
 void jqc_conn_main_logic_internal(xqc_connection_t* conn) {
+    if (conn == NULL) {
+        return;
+    }
     if (conn->conn_flag & XQC_CONN_FLAG_NO_DESTROY) {
         return;
     }

@@ -171,36 +171,41 @@ perlasm(test/trampoline-ppc.${ASM_EXT} test/asm/trampoline-ppc.pl)
 perlasm(test/trampoline-x86.${ASM_EXT} test/asm/trampoline-x86.pl)
 perlasm(test/trampoline-x86_64.${ASM_EXT} test/asm/trampoline-x86_64.pl)
 
-add_custom_command(
-  OUTPUT err_data.c
-  COMMAND ${GO_EXECUTABLE} run err_data_generate.go > ${CMAKE_CURRENT_BINARY_DIR}/err_data.c
-  DEPENDS
-  err/err_data_generate.go
-  err/asn1.errordata
-  err/bio.errordata
-  err/bn.errordata
-  err/cipher.errordata
-  err/conf.errordata
-  err/dh.errordata
-  err/digest.errordata
-  err/dsa.errordata
-  err/ecdh.errordata
-  err/ecdsa.errordata
-  err/ec.errordata
-  err/engine.errordata
-  err/evp.errordata
-  err/hkdf.errordata
-  err/obj.errordata
-  err/pem.errordata
-  err/pkcs7.errordata
-  err/pkcs8.errordata
-  err/rsa.errordata
-  err/ssl.errordata
-  err/trust_token.errordata
-  err/x509.errordata
-  err/x509v3.errordata
-  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/err
-)
+if(GO_EXECUTABLE)
+  add_custom_command(
+    OUTPUT err_data.c
+    COMMAND ${GO_EXECUTABLE} run err_data_generate.go > ${CMAKE_CURRENT_BINARY_DIR}/err_data.c
+    DEPENDS
+    err/err_data_generate.go
+    err/asn1.errordata
+    err/bio.errordata
+    err/bn.errordata
+    err/cipher.errordata
+    err/conf.errordata
+    err/dh.errordata
+    err/digest.errordata
+    err/dsa.errordata
+    err/ecdh.errordata
+    err/ecdsa.errordata
+    err/ec.errordata
+    err/engine.errordata
+    err/evp.errordata
+    err/hkdf.errordata
+    err/obj.errordata
+    err/pem.errordata
+    err/pkcs7.errordata
+    err/pkcs8.errordata
+    err/rsa.errordata
+    err/ssl.errordata
+    err/trust_token.errordata
+    err/x509.errordata
+    err/x509v3.errordata
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/err
+  )
+else()
+  configure_file(${PROJECT_SOURCE_DIR}/msvc/err_data.c
+                 ${CMAKE_CURRENT_BINARY_DIR}/err_data.c COPYONLY)
+endif()
 
 add_library(
   crypto

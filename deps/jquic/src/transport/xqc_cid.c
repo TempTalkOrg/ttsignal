@@ -10,7 +10,7 @@
 
 xqc_int_t
 xqc_generate_cid(xqc_engine_t *engine, xqc_cid_t *ori_cid, xqc_cid_t *cid,
-    uint64_t cid_seq_num)
+    uint64_t cid_seq_num, void *conn_user_data)
 {
     unsigned char *buf;
     ssize_t        len, written;
@@ -22,7 +22,7 @@ xqc_generate_cid(xqc_engine_t *engine, xqc_cid_t *ori_cid, xqc_cid_t *cid,
     len = cid->cid_len;
 
     if (engine->eng_callback.cid_generate_cb) {
-        written = engine->eng_callback.cid_generate_cb(ori_cid, buf, len, engine->user_data);
+        written = engine->eng_callback.cid_generate_cb(ori_cid, buf, len, engine->user_data, conn_user_data);
         if (written < XQC_OK) {
             xqc_log(engine->log, XQC_LOG_ERROR, "|generate cid failed [ret=%z]|", written);
             return -XQC_EGENERATE_CID;

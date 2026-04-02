@@ -88,15 +88,13 @@ xqc_timer_loss_detection_timeout(xqc_timer_type_t type, xqc_usec_t now, void *us
         xqc_path_send_one_or_two_ack_elicit_pkts(path, pns);
 
     } else {
-        /* assert(!PeerCompletedAddressValidation()) */
         if (xqc_conn_peer_complete_address_validation(conn)) {
             xqc_log(conn->log, XQC_LOG_WARN, "|exception|peer validated address while inflight bytes is 0|");
             return;
         }
 
-        /* Client sends an anti-deadlock packet */
         if (xqc_conn_has_hsk_keys(conn)) {
-            /* send Handshake packet proves address ownership. */
+            /* Client sends an anti-deadlock packet: Handshake packet proves address ownership. */
             xqc_conn_send_one_ack_eliciting_pkt(conn, XQC_PNS_HSK);
 
         } else {
@@ -528,7 +526,7 @@ void jqc_timer_timeout_cb(void *user_data)
     case XQC_TIMER_PATH_DRAINING:
         {
             xqc_send_ctl_t* send_ctl = (xqc_send_ctl_t*)timer->user_data;
-            conn = send_ctl->ctl_conn;
+            conn = (send_ctl != NULL) ? send_ctl->ctl_conn : NULL;
         }
         break;
     case XQC_TIMER_CONN_IDLE:

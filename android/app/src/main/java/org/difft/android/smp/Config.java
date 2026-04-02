@@ -32,6 +32,12 @@ public class Config {
     public boolean pingOn = false;
     // ping interval, in milliseconds
     public int pingInterval = 10000;
+    // active connection id limit
+    public int activeConnectionIdLimit = 1000;
+    // device type, 1 : phone, 2 : PC
+    public int deviceType = 0;
+    // cid tag
+    public String cidTag = "";
     public String logFile = "";
     public LogHandler logHandler = null;
     // Log level, error : E, info : I, debug : D, trace : T, warn : W

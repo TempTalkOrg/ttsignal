@@ -333,7 +333,7 @@ void SMPServerConnection::ProcessPacket(
                     server_->start_time.store(now);
                 }
                 server_->total_succeed_connections++;
-                LogQ(server_->logger_ctx_, "connection succeed(%" _U64BITARG_
+                LogQ(server_->logger_ctx_, _INFO_, "connection succeed(%" _U64BITARG_
                     "), duration : %" _U64BITARG_ ".",
                     server_->total_succeed_connections.load(),
                     (now - server_->start_time.load()) / 1000);
@@ -500,7 +500,7 @@ SMPServerConnection::WritePacket(
     } while (0);
 
     if (res < 0) {
-        LogCustom(server_->logger_ctx_, "WritePacket(write error : %d) ", res);
+        LogQ(server_->logger_ctx_, _ERROR_, "WritePacket(write error : %d) ", res);
         _set_state(this, CONN_STATE_FREED, BC_R_NETDOWN);
     }
     _CloseCheck();
@@ -553,7 +553,7 @@ void SMPServerConnection::ProcessRecvData(std::shared_ptr<RecvInfo> info, bool i
                     /*path id*/XQC_UNKNOWN_PATH_ID, (xqc_msec_t)info->recv_time, this, 
                     &info->scid, &info->dcid, info->sr_process) != XQC_OK)
                 {
-                    LogQ(server_->logger_ctx_, "SMPServerConnection::ProcessRecvData: packet process err\n");
+                    LogQ(server_->logger_ctx_, _ERROR_, "SMPServerConnection::ProcessRecvData: packet process err\n");
                     return;
                 }
                 jqc_conn_finish_recv(conn_);
@@ -926,7 +926,7 @@ BCRESULT SMPServer::Create(BCFObject* pConfig, IServerHandler* pHandler)
     engine_ = xqc_engine_create(XQC_ENGINE_SERVER, &config, 
         &config_.engine_ssl_config, &callback, &tcbs, this);
     if (engine_ == NULL) {
-        LogQ(logger_ctx_, "SMPServer create failed : error create engine\n");
+        LogQ(logger_ctx_, _ERROR_, "SMPServer create failed : error create engine\n");
         return BC_R_INVALIDARG;
     }
 
@@ -1074,7 +1074,7 @@ ssize_t SMPServer::WritePacket(
 
     if (size > XQC_PACKET_TMP_BUF_LEN)
     {
-        LogQ(logger_ctx_, "WritePacket err: size=%zu is too long\n", size);
+        LogQ(logger_ctx_, _ERROR_, "WritePacket err: size=%zu is too long\n", size);
         return XQC_SOCKET_ERROR;
     }
 
@@ -1473,14 +1473,15 @@ SMPServer::on_write_log(
 {
     SMPServer *ctx = (SMPServer*)engine_user_data;
 
-    LogCustom(ctx->logger_ctx_, "%.*s", count, buf);
+    int32_t level = XQCLogLevelToBCLogLevel(lvl);
+    LogQ(ctx->logger_ctx_, level, "%.*s", count, buf);
 }
 
 void SMPServer::on_keylog_cb(const xqc_cid_t *scid, const char *line,
                             void *user_data) {
     SMPServer *ctx = (SMPServer*)user_data;
     
-    LogCustom(ctx->logger_ctx_, "%s", line);
+    LogCustom(ctx->logger_ctx_, _INFO_, "%s", line);
 }
 
 int
@@ -1534,7 +1535,7 @@ SMPServer::on_stateless_reset(
 
 void SMPServer::DumpStats()
 {
-    //LogQ(logger_ctx_, "initial_pkts_recv : %" _U64BITARG_ 
+    //LogQ(logger_ctx_, _DEBUG_, "initial_pkts_recv : %" _U64BITARG_ 
     //    "; initial_pkts_in_js : %" _U64BITARG_ 
     //    "; initial_pkts_in_c : %" _U64BITARG_, 
     //    initial_pkts_recv.load(),
@@ -1547,7 +1548,8 @@ SMPServer::cid_generate(
     const xqc_cid_t* ori_cid, 
     uint8_t* cid_buf, 
     size_t cid_buflen, 
-    void* engine_user_data)
+    void* engine_user_data,
+    void *conn_user_data)
 {
     SMPServer*_this = (SMPServer*)engine_user_data;
     if (!_this)

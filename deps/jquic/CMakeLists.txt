@@ -24,8 +24,76 @@ set(SSL_INC_PATH "../boringssl/src/include")
 set(XQC_ENABLE_BBR2 true)
 set(XQC_ENABLE_RENO true)
 
-add_compile_options(-fPIC)
+
 set(LIBRARY_OUTPUT_PATH ${CMAKE_CURRENT_SOURCE_DIR}/lib/${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}/${CMAKE_BUILD_TYPE})
+
+if(MSVC)
+    set(MSVC_DISABLED_WARNINGS_LIST
+        "C4061" # enumerator 'identifier' in switch of enum 'enumeration' is not
+                # explicitly handled by a case label
+                # Disable this because it flags even when there is a default.
+        "C4100" # 'exarg' : unreferenced formal parameter
+        "C4127" # conditional expression is constant
+        "C4200" # nonstandard extension used : zero-sized array in
+                # struct/union.
+        "C4204" # nonstandard extension used: non-constant aggregate initializer
+        "C4221" # nonstandard extension used : 'identifier' : cannot be
+                # initialized using address of automatic variable
+        "C4242" # 'function' : conversion from 'int' to 'uint8_t',
+                # possible loss of data
+        "C4244" # 'function' : conversion from 'int' to 'uint8_t',
+                # possible loss of data
+        "C4267" # conversion from 'size_t' to 'int', possible loss of data
+        "C4371" # layout of class may have changed from a previous version of the
+                # compiler due to better packing of member '...'
+        "C4388" # signed/unsigned mismatch
+        "C4296" # '>=' : expression is always true
+        "C4350" # behavior change: 'std::_Wrap_alloc...'
+        "C4365" # '=' : conversion from 'size_t' to 'int',
+                # signed/unsigned mismatch
+        "C4389" # '!=' : signed/unsigned mismatch
+        "C4464" # relative include path contains '..'
+        "C4510" # 'argument' : default constructor could not be generated
+        "C4512" # 'argument' : assignment operator could not be generated
+        "C4514" # 'function': unreferenced inline function has been removed
+        "C4548" # expression before comma has no effect; expected expression with
+                # side-effect" caused by FD_* macros.
+        "C4610" # struct 'argument' can never be instantiated - user defined
+                # constructor required.
+        "C4623" # default constructor was implicitly defined as deleted
+        "C4625" # copy constructor could not be generated because a base class
+                # copy constructor is inaccessible or deleted
+        "C4626" # assignment operator could not be generated because a base class
+                # assignment operator is inaccessible or deleted
+        "C4628" # digraphs not supported with -Ze
+        "C4668" # 'symbol' is not defined as a preprocessor macro, replacing with
+                # '0' for 'directives'
+                # Disable this because GTest uses it everywhere.
+        "C4706" # assignment within conditional expression
+        "C4710" # 'function': function not inlined
+        "C4711" # function 'function' selected for inline expansion
+        "C4800" # 'int' : forcing value to bool 'true' or 'false'
+                # (performance warning)
+        "C4820" # 'bytes' bytes padding added after construct 'member_name'
+        "C5026" # move constructor was implicitly defined as deleted
+        "C5027" # move assignment operator was implicitly defined as deleted
+        "C5045" # Compiler will insert Spectre mitigation for memory load if
+                # /Qspectre switch specified
+    )
+    set(MSVC_LEVEL4_WARNINGS_LIST
+        # See https://connect.microsoft.com/VisualStudio/feedback/details/1217660/warning-c4265-when-using-functional-header
+        "C4265" # class has virtual functions, but destructor is not virtual
+    )
+    string(REPLACE "C" " -wd" MSVC_DISABLED_WARNINGS_STR
+                            ${MSVC_DISABLED_WARNINGS_LIST})
+    string(REPLACE "C" " -w4" MSVC_LEVEL4_WARNINGS_STR
+                            ${MSVC_LEVEL4_WARNINGS_LIST})
+    set(CMAKE_C_FLAGS   "-utf-8 -EHsc ${MSVC_DISABLED_WARNINGS_STR} ${MSVC_LEVEL4_WARNINGS_STR}")
+    set(CMAKE_CXX_FLAGS "-utf-8 -EHsc ${MSVC_DISABLED_WARNINGS_STR} ${MSVC_LEVEL4_WARNINGS_STR}")
+    add_compile_options(/wd4098 /wd4113 /wd5039 /wd5204)
+else()
+    add_compile_options(-fPIC)
+endif()
 
 # SSL lib type, jquic support babassl and boringssl interfaces
 if(NOT SSL_TYPE)
@@ -108,12 +176,16 @@ endif()
 
 
 # C_FLAGS
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -O2 -std=gnu11 -Wall -DNDEBUG_PRINT -DNPRINT_MALLOC ")
-set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS} -g -O0 -std=gnu11 -Wall -DNDEBUG_PRINT -DNPRINT_MALLOC -DXQC_DEBUG ")
-
-if(NOT CMAKE_SYSTEM_NAME MATCHES "Windows" OR CMAKE_C_COMPILER MATCHES "mingw")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Werror -Wno-unused -Wno-pointer-sign -Wno-format-security ")
-    set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Werror -Wno-unused -Wno-pointer-sign -Wno-format-security ")
+if(MSVC)
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DNDEBUG_PRINT -DNPRINT_MALLOC ")
+    set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -DNDEBUG_PRINT -DNPRINT_MALLOC -DXQC_DEBUG ")
+else()
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -O2 -std=gnu11 -Wall -DNDEBUG_PRINT -DNPRINT_MALLOC ")
+    set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS} -g -O0 -std=gnu11 -Wall -DNDEBUG_PRINT -DNPRINT_MALLOC -DXQC_DEBUG ")
+    if(NOT CMAKE_SYSTEM_NAME MATCHES "Windows" OR CMAKE_C_COMPILER MATCHES "mingw")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Werror -Wno-unused -Wno-pointer-sign -Wno-format-security ")
+        set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Werror -Wno-unused -Wno-pointer-sign -Wno-format-security ")
+    endif()
 endif()
 
 # additional C_FLAGS on mac

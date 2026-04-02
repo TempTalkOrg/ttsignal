@@ -182,7 +182,7 @@ uint32_t LogLevelToBCLogLevel(uint32_t level)
     case 'e':
         return _ERROR_;
     case 'w':
-        return _WARNING_;
+        return _WARN_;
     case 'i':
         return _INFO_;
     case 'd':
@@ -225,8 +225,37 @@ std::string StatFixedAllocToString(uint32_t nFilter)
     return writer.write(retRoot);
 }
 
+int32_t XQCLogLevelToBCLogLevel(int32_t lvl)
+{
+    int32_t level = _INFO_;
+    switch (lvl)
+    {
+        case XQC_LOG_FATAL:
+            level = _FATAL_;
+            break;
+        case XQC_LOG_ERROR:
+            level = _ERROR_;
+            break;
+        case XQC_LOG_WARN:
+            level = _WARN_;
+            break;
+        case XQC_LOG_REPORT:
+        case XQC_LOG_STATS:
+        case XQC_LOG_INFO:
+            level = _INFO_;
+            break;
+        case XQC_LOG_DEBUG:
+            level = _DEBUG_;
+            break;
+        default:
+            level = _INFO_;
+            break;
+    }
+    return level;
+}
+
 void
-LogQ(const void *logger_ctx, const char* szFmtStr, ...)
+LogQ(const void *logger_ctx, int32_t nLevel, const char* szFmtStr, ...)
 {
 	va_list args;
 	char timestr[64];
@@ -234,7 +263,7 @@ LogQ(const void *logger_ctx, const char* szFmtStr, ...)
 	BCPString strFmt;
 	strFmt.Format("[%s] %s", timestr, szFmtStr);
 	va_start(args, szFmtStr);
-	LogCustomV(logger_ctx, strFmt.c_str(), args);
+	LogCustomV(logger_ctx, nLevel, strFmt.c_str(), args);
 	va_end(args);
 }
 
@@ -538,6 +567,27 @@ std::string DecodeURI(const std::string& encoded_string) {
     // 重新调整内存大小以节省空间
     std::string ret(decoded_string);
     return ret;
+}
+
+const char* GetSDKVersion() 
+{
+    static char ver[20] = {0};
+    if (ver[0] == 0) 
+    {
+        const char* d = __DATE__; // "Mmm dd yyyy"
+        int y = (d[7]-'0')*1000+(d[8]-'0')*100+(d[9]-'0')*10+(d[10]-'0');
+        int m = (d[0]=='J'&&d[1]=='a')?1 :d[0]=='F'?2
+              : (d[0]=='M'&&d[2]=='r')?3 :(d[0]=='A'&&d[1]=='p')?4
+              :  d[0]=='M'?5 :(d[0]=='J'&&d[2]=='n')?6
+              :  d[0]=='J'?7 : d[0]=='A'?8 :d[0]=='S'?9
+              :  d[0]=='O'?10: d[0]=='N'?11:12;
+        int dy = (d[4]==' '?0:(d[4]-'0')*10)+(d[5]-'0');
+        static BCSpinMutex mutex;
+        mutex.Lock();
+        snprintf(ver, sizeof(ver), "1.0.0.%04d%02d%02d", y, m, dy);
+        mutex.Unlock();
+    }
+    return ver;
 }
 
 ///////////////////////////////////////////////////////////////////////////////

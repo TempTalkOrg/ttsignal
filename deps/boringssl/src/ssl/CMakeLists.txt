@@ -2,10 +2,6 @@ include_directories(../include)
 
 set(LIBRARY_OUTPUT_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}/${CMAKE_BUILD_TYPE})
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
-  add_compile_options(-fPIC)
-endif()
-
 add_library(
   ssl
 

@@ -387,8 +387,8 @@ class Stream extends EventEmitter {
      *
      * @method sendCommand
      * @public
-     * @param timestamp {Number} timestamp.
-     * @param cmd {Buffer} commnd to send.
+     * @param cmd {Object} command to send.
+     * @param callback {Function} callback function.
      * @example
      *     conn.sendCommand(cmd);
      **/
@@ -662,12 +662,14 @@ ttsignal.ServerConnection.prototype._internalCallback = function(type, __arg2, _
  *
  * @method sendCommand
  * @public
- * @param timestamp {Number} timestamp.
- * @param cmd {Buffer} commnd to send.
+ * @param cmd {Object} command to send.
+ * @param callback {Function} callback function.
  * @example
- *     conn.sendCommand(cmd);
+ *     conn.sendCommand(cmd, function(result){
+ *         console.log(result);
+ *     });
  **/
-ttsignal.ServerConnection.prototype.sendCommand = function(cmd){
+ttsignal.ServerConnection.prototype.sendCommand = function(cmd, callback){
     if (typeof(cmd) != 'object') {
         throw Error('Invalid command value.');
     }

@@ -290,7 +290,7 @@ BCRESULT UDPSender::_InitSocket()
 	m_pSocket->GetSockName(&m_sSelfAddr);
 	char local_addr_str_[128];
 	bc_sockaddr_format(&m_sSelfAddr, local_addr_str_, sizeof(local_addr_str_));
-	LogQ(m_pLoggerCtx, "UDP Sender: started at %s", local_addr_str_);
+	LogQ(m_pLoggerCtx, _INFO_, "UDP Sender: started at %s", local_addr_str_);
 
 	return BC_R_SUCCESS;
 

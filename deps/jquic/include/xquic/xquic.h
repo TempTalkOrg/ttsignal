@@ -109,7 +109,7 @@ typedef void (*xqc_set_event_timer_pt)(xqc_usec_t wake_after, void *engine_user_
  * count of written bytes is less than cid_buflen, xquic will fill rest of cid_buf with random bytes
  */
 typedef ssize_t (*xqc_cid_generate_pt)(const xqc_cid_t *ori_cid, uint8_t *cid_buf,
-    size_t cid_buflen, void *engine_user_data);
+    size_t cid_buflen, void *engine_user_data, void *conn_user_data);
 
 /**
  * @brief engine secret log callback. will only be effective when build with XQC_PRINT_SECRET

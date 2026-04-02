@@ -21,11 +21,9 @@ gettimeofday(struct timeval *tv, struct timezone *tz)
     static int  tzflag;
     if (NULL != tv) {
         GetSystemTimeAsFileTime(&ft);
-        tmpres = ((uint64_t) ft.dwHighDateTime << 32)
-               | (ft.dwLowDateTime);
-        tmpres -= DELTA_EPOCH_IN_TICKS;
-        tv->tv_sec = tmpres / 10000000;
-        tv->tv_usec = tmpres % 1000000;
+        tmpres = ((uint64_t) ft.dwHighDateTime << 32) | (ft.dwLowDateTime);
+		tv->tv_sec = (long)((tmpres - DELTA_EPOCH_IN_TICKS) / 10000000ULL);
+        tv->tv_usec = (long)((tmpres % 10000000ULL) / 10ULL);
     }
 
     if (NULL != tz) {

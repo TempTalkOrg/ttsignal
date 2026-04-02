@@ -389,7 +389,8 @@ private:
                         const xqc_cid_t* ori_cid, 
                         uint8_t* cid_buf, 
                         size_t cid_buflen, 
-                        void* engine_user_data);
+                        void* engine_user_data,
+                        void *conn_user_data);
 
 public:
     BCSpinMutex             lock_;

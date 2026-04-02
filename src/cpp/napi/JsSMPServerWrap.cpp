@@ -196,13 +196,11 @@ void JsSMPServerWrap::OnJsAccept(JsSMPServerConnectionWrap* pConn)
     {
         Napi::Function callback = m_hCallback.Value().As<Napi::Function>();
         
-        // 准备参数
         std::initializer_list<Napi::Value> argv = { 
             Napi::String::New(m_env, connection_sym), 
-            pConn->Value()  // 获取连接对象的 JS 表示
+            pConn->Value()
         };
         
-        // 调用回调函数并处理可能的异常
         try {
             callback.Call(Value(), argv);
         } catch (const std::exception& e) {
@@ -221,15 +219,12 @@ void JsSMPServerWrap::OnJsClose()
 {
 	Napi::HandleScope scope(m_env);
 
-	// 获取回调函数
     if (m_hCallback.Value().IsFunction())
     {
         Napi::Function callback = m_hCallback.Value().As<Napi::Function>();
         
-        // 准备参数
         std::initializer_list<Napi::Value> argv = { Napi::String::New(m_env, close_sym) };
         
-        // 调用回调函数并处理可能的异常
         try {
             callback.Call(Value(), argv);
         } catch (const std::exception& e) {
@@ -482,8 +477,6 @@ void JsSMPServerConnectionWrap::OnJsExecDone(RPCStub *pStub)
 					m_env.Null(),
 					Napi::String::New(m_env, (const char*)pStub->m_lParams[0], pStub->m_lParams[1])
 				};
-				// TRY_CATCH_CALL(m_env, Value(), pStub->m_fCallback, argv);
-				// 调用回调函数并处理可能的异常
 				try {
 					pStub->m_fCallback.Call(Value(), argv);
 				} catch (const std::exception& e) {
@@ -558,7 +551,6 @@ void JsSMPServerConnectionWrap::OnJsClosed(LPCSTR strReason)
 	Napi::HandleScope scope(m_env);
 
 	m_pConn.reset();
-	// 获取回调函数
     if (m_hCallback.Value().IsFunction())
     {
         Napi::Function callback = m_hCallback.Value().As<Napi::Function>();

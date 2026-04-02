@@ -152,12 +152,16 @@ Json::Value StatFixedAlloc(uint32_t nFilter);
 
 std::string StatFixedAllocToString(uint32_t nFilter);
 
+int32_t XQCLogLevelToBCLogLevel(int32_t level);
+
 void
-LogQ(const void *logger_ctx, const char* szFmtStr, ...);
+LogQ(const void *logger_ctx, int32_t nLevel, const char* szFmtStr, ...);
 
 std::string EncodeURI(const std::string& uri_string);
 
 std::string DecodeURI(const std::string& encoded_string);
+
+const char* GetSDKVersion();
 
 ///////////////////////////////////////////////////////////////////////////////
 // End of namespace : node

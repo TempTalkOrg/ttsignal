@@ -166,7 +166,7 @@ public class Connection {
         return userObject;
     }
 
-    public void restart(int streamId){
+    public void restart(){
         if (isClosed()){
             return;
         }

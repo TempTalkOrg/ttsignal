@@ -1,0 +1,13 @@
+#!/bin/bash
+
+script_dir=$(dirname $(realpath $0))
+
+cd ${script_dir}
+cp -rf ${script_dir}/../../src/js/index.js ${script_dir}/../../node_modules/ttsignal/
+cmake   -DCMAKE_BUILD_TYPE=Release \
+        -DTARGET_PLATFORM_LINUX:BOOL=ON \
+        -DCMAKE_TOOLCHAIN_FILE=${script_dir}/../../src/cpp/cmake/linux.x64.toolchain.cmake \
+        ${script_dir}/../../src
+make -j8
+# strip
+/opt/homebrew/bin/x86_64-unknown-linux-gnu-strip ${script_dir}/../../node_modules/ttsignal/Release/ttsignal.linux.x64.node

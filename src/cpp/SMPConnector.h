@@ -9,7 +9,7 @@
 #include "BC/BCSocket.h"
 #include "BC/BCTask.h"
 #include "BC/BCLog.h"
-#include "UDPSender.h"
+#include "UDPSenderGroup.h"
 #include "Interface.h"
 #include "SMPParser.h"
 #include "Utils.h"
@@ -25,6 +25,9 @@
 ///////////////////////////////////////////////////////////////////////////////
 // Forward declarations
 ///////////////////////////////////////////////////////////////////////////////
+
+#define SMP_CID_TAG_LEN 11
+#define SMP_CID_LEN 16
 
 class SMPConnector;
 class SMPConnection;
@@ -154,12 +157,7 @@ class SMPConnection
     class Config
     {
     public:
-        Config() : ipv6(false), host(NULL), port(0), server_host(NULL), server_port(0)
-            , c_cong_ctl('b'), pacing_on(false), idle_time_out(0), ping_on(false)
-            , linger_on(false), ping_interval(0), active_connection_id_limit(0)
-            , alpn(NULL)
-        {
-        }
+        Config();
 
         ~Config()
         {
@@ -178,6 +176,8 @@ class SMPConnection
         uint32_t                    ping_interval;
         uint64_t                    active_connection_id_limit;
         LPCSTR                      alpn;
+        uint8_t                     device_type;
+        uint8_t                     cid_tag[SMP_CID_TAG_LEN];
 
         BCRESULT		Init(BCFObject* pConfig);
         LPCSTR          Strdup(LPCSTR str)
@@ -303,7 +303,7 @@ private:
     IConnectionHandler  *   handler_ = NULL;
     IRPCStub            *   connect_rpc_ = NULL;
     int32_t                 connect_timer_id_ = 0;
-    UDPSender           *   udp_socket_ = NULL;
+    UDPSenderGroup      *   udp_socket_ = NULL;
     bool                    webtransport_ = false;
     // Asynch state
     ConnState               state_;
@@ -542,7 +542,8 @@ private:
                         const xqc_cid_t* ori_cid, 
                         uint8_t* cid_buf, 
                         size_t cid_buflen, 
-                        void* engine_user_data);
+                        void* engine_user_data,
+                        void *conn_user_data);
 
     static void     log_callback(void *data, int level, LPCSTR lpszMsg);
 public:
