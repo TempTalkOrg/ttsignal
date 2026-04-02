@@ -1,0 +1,78 @@
+
+#ifndef RTMP_PLAYLIST_H_INCLUDED__
+#define RTMP_PLAYLIST_H_INCLUDED__
+
+#include <RTMP/Exports.h>
+#include <RTMP/FLVUtils.h>
+
+using namespace FLVUtils;
+
+///////////////////////////////////////////////////////////////////////////////
+// Namespace : RTMP
+///////////////////////////////////////////////////////////////////////////////
+
+namespace RTMP
+{
+
+///////////////////////////////////////////////////////////////////////////////
+/// class : PlayItem
+///////////////////////////////////////////////////////////////////////////////
+
+class RTMP_API PlayItem
+{
+	//DECLARE_FIXED_ALLOC(PlayItem);
+public:
+	PlayItem();
+	PlayItem(
+		const BCPString &strStrmName,
+		int32_t nStart = -2,
+		int32_t nDuration = -1);
+	PlayItem(const PlayItem &playItem);
+	~PlayItem();
+
+	void operator = (const PlayItem &playItem);
+
+public:
+	FLVUri				m_sUri;
+	int32_t				m_nStart;
+	int32_t				m_nDuration;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+/// class : PlayList
+///////////////////////////////////////////////////////////////////////////////
+
+class RTMP_API PlayList
+{
+	//DECLARE_FIXED_ALLOC(PlayList);
+public:
+	PlayList();
+	~PlayList();
+
+	uint32_t		AddItem(
+						const BCPString &strStrmName,
+						int32_t nStart = -2,
+						int32_t nDuration = -1);
+	PlayItem	*	Current();
+	PlayItem	*	NextItem();
+	void			Rewind();
+	uint32_t		Flush();
+
+protected:
+private:
+	DECLARE_NO_COPY_CLASS(PlayList);
+	BCVector<PlayItem *>		m_vecPlayList;
+	int32_t						m_nCrrentItem;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// End of namespace : RTMP
+///////////////////////////////////////////////////////////////////////////////
+
+}
+
+#endif // RTMP_PLAYLIST_H_INCLUDED__
+
+///////////////////////////////////////////////////////////////////////////////
+// End of file : Playlist.h
+///////////////////////////////////////////////////////////////////////////////
