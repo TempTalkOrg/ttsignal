@@ -88,6 +88,14 @@ BCFObject *SMPConfig::ConvertFromJava(JNIEnv *env, jobject obj)
 		JniUtils::GetIntField(env, obj, cls, "logLevel"));
 		pConfig->PutInt("num_of_senders",
 			JniUtils::GetIntField(env, obj, cls, "numOfSenders"));
+	JniUtils::GetStringField(env, obj, cls, "serverHost", strValue);
+	if (!strValue.empty()) {
+		pConfig->PutString("server_host", strValue);
+	}
+	JniUtils::GetStringField(env, obj, cls, "caCertPem", strValue);
+	if (!strValue.empty()) {
+		pConfig->PutString("ca_cert_pem", strValue);
+	}
 	env->DeleteLocalRef(cls);
 	return pConfig;
 }

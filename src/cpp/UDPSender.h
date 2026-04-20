@@ -33,6 +33,7 @@ public:
 	virtual void	OnRecvData(
 						BCBuffer* pBuffer, 
 						BCSockAddrS& refSrcAddr)	= 0;
+	virtual void	OnCheckAvailable()				= 0;
 	virtual void	OnRestart(BCRESULT result)		= 0;
 	virtual void	OnUdpClosed()					= 0;
 };
@@ -51,6 +52,7 @@ class UDPSender : public BCEventQueue
 	{
 	public:
 		Config() : ipv6(false), publishId(5), host(NULL), port(0)
+			, checkAvailableInterval(2000000)
 		{
 		}
 
@@ -69,6 +71,7 @@ class UDPSender : public BCEventQueue
 			publishId = other.publishId;
 			host = pool_.Strdup(other.host);
 			port = other.port;
+			checkAvailableInterval = other.checkAvailableInterval;
 			return *this;
 		}
 
@@ -76,6 +79,7 @@ class UDPSender : public BCEventQueue
 		uint32_t			publishId;
 		LPCSTR				host;
 		uint16_t			port;
+		uint32_t			checkAvailableInterval;
 
 		BCRESULT		Init(BCFObject *pConfig)
 		{
@@ -101,6 +105,11 @@ class UDPSender : public BCEventQueue
 			{
 				port = (uint32_t)GET_BCF_INT(pVar);
 			}
+			pVar = pConfig->Get("checkAvailableInterval");
+			if (IS_BCF_NUMBER(pVar))
+			{
+				checkAvailableInterval = (uint32_t)GET_BCF_INT(pVar);
+			}
 			return BC_R_SUCCESS;
 		}
 
@@ -120,7 +129,7 @@ public:
 						IUDPSenderHandler *pHandler,
 						bool bindIP = false,
 						bool bindPort = false);
-	BCRESULT 		Restart();
+	BCRESULT 		Restart(bool checkAvailable = false, int64_t networkHandle = 0);
 	BCRESULT		Start(LPCSTR szHost, uint16_t nPort);
 	BCRESULT		StartRecv();
 	BCRESULT		Connect(BCSockAddrS& refSockAddr);
@@ -147,6 +156,7 @@ protected:
 	void			_StopWork();
 	void			_Cleanup();
 	BOOL			_ExitCheck();
+	void			_Restart();
 	void			_UDP_RecvChunk();
 	BCRESULT		_UDP_Send(
 						BCSockAddrS &refSockAddr, 
@@ -204,7 +214,11 @@ private:
 	IUDPSenderHandler	*	m_pHandler;
 	bool 					m_bBindIP;
 	bool 					m_bBindPort;
-	bool 					m_bRestart;
+	uint32_t 				m_nPendingRestart;
+	bool 					m_bCheckAvailable;
+	int32_t 				m_nCheckAvailableTimerId;
+	uint32_t 				m_nRecvDataCount;
+	int64_t 				m_nNetworkHandle;
 };
 
 #endif // UDPSENDER_H_INCLUDED__

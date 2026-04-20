@@ -75,7 +75,7 @@ BCRESULT SMPConnectionWrap::Initialize(JNIEnv *env)
 		},
 		{
 			(char*)"restart",
-			(char*)"(J)V",
+			(char*)"(JJ)V",
 			reinterpret_cast<void*>(_Restart)
 		},
 		{
@@ -228,12 +228,12 @@ jint SMPConnectionWrap::_SendPacket(
 	return BC_R_INVALIDARG;
 }
 
-void SMPConnectionWrap::_Restart(JNIEnv* env, jobject obj, jlong handle)
+void SMPConnectionWrap::_Restart(JNIEnv* env, jobject obj, jlong handle, jlong networkHandle)
 {
 	SMPConnectionWrap *_this = reinterpret_cast<SMPConnectionWrap*>(handle);
 	if (_this && _this->m_pConn)
 	{
-		_this->m_pConn->Restart();
+		_this->m_pConn->Restart((int64_t)networkHandle);
 	}
 }
 
@@ -344,11 +344,45 @@ void SMPConnectionWrap::OnStreamClosed(uint32_t nStreamId)
 			"onStreamClosed", "(Lorg/difft/android/smp/Connection;I)V");
 		if (mid)
 		{
-			pEnv->CallVoidMethod(m_pHandler, mid, m_pSelf, nStreamId);
+			pEnv->CallVoidMethod(m_pHandler, mid, m_pSelf, (jint)nStreamId);
 		}
 	}
 }
 
+void SMPConnectionWrap::OnStreamDataAcked(
+	uint32_t nStreamId,
+	xqc_usec_t ack_delay_time,
+	size_t acked_bytes,
+	size_t inflight_bytes)
+{
+	if (m_pHandler && m_pHandlerCls)
+	{
+		JNIEnv* pEnv = GetThreadJNIEnv();
+		jmethodID mid = JniUtils::GetMethodID(pEnv, m_pHandlerCls,
+			"onStreamDataAcked", "(Lorg/difft/android/smp/Connection;IJII)V");
+		if (mid)
+		{
+			pEnv->CallVoidMethod(m_pHandler, mid, m_pSelf, (jint)nStreamId, (jlong)ack_delay_time, (jint)acked_bytes, (jint)inflight_bytes);
+		}
+	}
+}
+
+void SMPConnectionWrap::OnStreamDataSent(
+	uint32_t nStreamId, 
+	uint32_t nTransId,
+	size_t size)
+{
+	if (m_pHandler && m_pHandlerCls)
+	{
+		JNIEnv* pEnv = GetThreadJNIEnv();
+		jmethodID mid = JniUtils::GetMethodID(pEnv, m_pHandlerCls,
+			"onStreamDataSent", "(Lorg/difft/android/smp/Connection;III)V");
+		if (mid)
+		{
+			pEnv->CallVoidMethod(m_pHandler, mid, m_pSelf, (jint)nStreamId, (jint)nTransId, (jint)size);
+		}
+	}
+}
 void SMPConnectionWrap::OnRecvCmd(
 	const SMPHeader& refHeader,
 	LPCSTR lpszCmd, 
@@ -514,8 +548,12 @@ BCRESULT SMPConnectorWrap::Create(BCFObject *pConfig, LogHandler *pLogHandler)
 
 		Runtime::Initialize(pConfig);
 		sockConfig.PutBool("ipv6", 0);
-		sockConfig.PutString("server_host", "example.com");
-		//sockConfig.PutInt("port", server_port);
+		BCFVar* pHostname = pConfig->Get("hostname");
+		if (IS_BCF_STRING(pHostname) && strlen(GET_BCF_STRING(pHostname)) > 0) {
+			sockConfig.PutString("server_host", GET_BCF_STRING(pHostname));
+		} else {
+			sockConfig.PutString("server_host", "example.com");
+		}
 		/* client does not need to fill in private_key_file & certificate_file */
 		sockConfig.PutString("tls_ciphers", XQC_TLS_CIPHERS);
 		sockConfig.PutString("tls_groups", MY_TLS_GROUPS);

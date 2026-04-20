@@ -21,6 +21,11 @@ void UDPSenderGroup::SenderHandler::OnRecvData(BCBuffer* pBuffer, BCSockAddrS& r
     group_->OnSenderRecvData(sender_, pBuffer, refSrcAddr);
 }
 
+void UDPSenderGroup::SenderHandler::OnCheckAvailable()
+{
+    group_->OnSenderCheckAvailable(sender_);
+}
+
 void UDPSenderGroup::SenderHandler::OnRestart(BCRESULT result)
 {
     group_->OnSenderRestart(sender_, result);
@@ -112,12 +117,24 @@ BCRESULT UDPSenderGroup::Create(
     return BC_R_SUCCESS;
 }
 
-BCRESULT UDPSenderGroup::Restart()
+BCRESULT UDPSenderGroup::Restart(int64_t networkHandle)
 {
     BCRESULT last = BC_R_SUCCESS;
     for (auto& entry : senders_)
     {
-        BCRESULT r = entry.sender->Restart();
+        BCRESULT r = entry.sender->Restart(false, networkHandle);
+        if (r != BC_R_SUCCESS)
+            last = r;
+    }
+    return last;
+}
+
+BCRESULT UDPSenderGroup::Connect(BCSockAddrS& refSockAddr)
+{
+    BCRESULT last = BC_R_SUCCESS;
+    for (auto& entry : senders_)
+    {
+        BCRESULT r = entry.sender->Connect(refSockAddr);
         if (r != BC_R_SUCCESS)
             last = r;
     }
@@ -223,6 +240,14 @@ void UDPSenderGroup::OnSenderRecvData(
              addr_str, (uint32_t)senders_.size());
     }
     handler_->OnRecvData(pBuffer, refSrcAddr);
+}
+
+void UDPSenderGroup::OnSenderCheckAvailable(UDPSender* sender)
+{
+    if (!converged_ || sender == winner_)
+    {
+        handler_->OnCheckAvailable();
+    }
 }
 
 void UDPSenderGroup::OnSenderRestart(UDPSender* sender, BCRESULT result)

@@ -1,7 +1,7 @@
-///////////////////////////////////////////////////////////////////////////////
+/// ////////////////////////////////////////////////////////////////////////////
 // file : Packet.java
 // author : antoniozhou
-///////////////////////////////////////////////////////////////////////////////
+/// ////////////////////////////////////////////////////////////////////////////
 
 package org.difft.android.smp;
 
@@ -10,7 +10,9 @@ public class Packet {
     private boolean builded = false;
 
     private native long initialize();
+
     private native void build(long handle);
+
     private native void destroy(long handle);
 
     static {
@@ -20,24 +22,29 @@ public class Packet {
     public Packet() {
         handle = initialize();
     }
+
     public void build() {
         if (handle != 0) {
             build(handle);
             builded = true;
         }
     }
+
     public void buildOnce() {
         if (handle != 0 && !builded) {
             build(handle);
             builded = true;
         }
     }
+
     public boolean isBuilded() {
         return builded;
     }
+
     public long getHandle() {
         return handle;
     }
+
     protected void finalize() throws Throwable {
         if (handle != 0) {
             destroy(handle);

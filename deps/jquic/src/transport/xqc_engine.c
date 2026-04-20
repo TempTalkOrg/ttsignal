@@ -1319,6 +1319,22 @@ jqc_conn_packet_process(xqc_connection_t* conn,
                     "|local addr too large|addr_len:%d|", (int)local_addrlen);
         }
         xqc_log_event(conn->log, CON_CONNECTION_STARTED, conn, XQC_LOG_LOCAL_EVENT);
+
+    } else if (local_addr && local_addrlen > 0
+               && !xqc_is_same_addr((struct sockaddr *)conn->local_addr, local_addr))
+    {
+        ret = xqc_memcpy_with_cap(conn->local_addr, sizeof(conn->local_addr),
+                                  local_addr, local_addrlen);
+        if (ret == XQC_OK) {
+            conn->local_addrlen = local_addrlen;
+            if (conn->conn_initial_path) {
+                xqc_memcpy(conn->conn_initial_path->local_addr, local_addr, local_addrlen);
+                conn->conn_initial_path->local_addrlen = local_addrlen;
+                conn->conn_initial_path->addr_str_len = 0;
+            }
+            xqc_log(conn->log, XQC_LOG_DEBUG,
+                    "|local addr changed|conn:%p|new_addr_len:%d|", conn, (int)local_addrlen);
+        }
     }
 
     /* NAT rebinding */

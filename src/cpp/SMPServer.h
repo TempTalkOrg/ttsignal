@@ -287,6 +287,7 @@ private:
     // Override IUDPPacketHandler interfaces
     void	        OnSendData(uint32_t nWrite, UDPSender* pSender) override;
     void	        OnRecvData(BCBuffer* pBuffer, BCSockAddrS& refSrcAddr) override;
+    void            OnCheckAvailable() override;
     void            OnRestart(BCRESULT result) override;
     void            OnUdpClosed() override;
 

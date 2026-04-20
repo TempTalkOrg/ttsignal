@@ -29,7 +29,7 @@ xqc_generate_sample(xqc_sample_t *sampler, xqc_send_ctl_t *send_ctl,
     /* the ACK acks nothing */
     if (sampler->prior_time == 0) {
         sampler->interval = 0;
-        xqc_log(send_ctl->ctl_conn->log, XQC_LOG_WARN, 
+        xqc_log(send_ctl->ctl_conn->log, XQC_LOG_DEBUG, 
                 "|sampler_prior_time_is_zero!|");
         return XQC_RATE_SAMPLE_ACK_NOTHING;
     }

@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <memory>
 #include <atomic>
+#include <openssl/x509.h>
 
 ///////////////////////////////////////////////////////////////////////////////
 // Forward declarations
@@ -58,6 +59,7 @@ public:
     BCRESULT        SendPacket(SMPacketPtr pkt);
     void            Close();
     int             OnRead();
+    int             OnWriteNotify();
     void            OnClosing();
     void            OnClose();
 
@@ -72,6 +74,8 @@ public:
     void            OnDataPacked(
                         void* payload, 
                         size_t payload_size) override;
+protected:
+    void            _SendBuffList();
 private:
     xqc_stream_id_t         stream_id_ = 0;
     SMPConnection       *   conn_ = NULL;
@@ -79,6 +83,7 @@ private:
     unsigned char           recv_buff_[4096]    = { 0 };
     size_t                  recv_buff_size_     = 4096;
     bool                    recv_wt_mask_ = false;
+    std::list<SMPacketPtr>  send_buff_list_;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -178,6 +183,8 @@ class SMPConnection
         LPCSTR                      alpn;
         uint8_t                     device_type;
         uint8_t                     cid_tag[SMP_CID_TAG_LEN];
+        LPCSTR                      ca_cert_pem;
+        size_t                      ca_cert_pem_len;
 
         BCRESULT		Init(BCFObject* pConfig);
         LPCSTR          Strdup(LPCSTR str)
@@ -203,7 +210,7 @@ public:
                         uint64_t id);
     BCRESULT        Connect(IRPCStub* pStub);
     BCRESULT		SendPacket(SMPacketPtr pkt);
-    void            Restart();
+    void            Restart(int64_t networkHandle = 0);
     void            Close();
     void            CloseStream(uint32_t nStreamId);
 protected:
@@ -246,6 +253,7 @@ protected:
     // Override IUDPPacketHandler interfaces
     void	        OnSendData(uint32_t nWrite, UDPSender* pSender) override;
     void	        OnRecvData(BCBuffer* pBuffer, BCSockAddrS& refSrcAddr) override;
+    void	        OnCheckAvailable() override;
     void	        OnRestart(BCRESULT result) override;
     void            OnUdpClosed() override;
     // Override BCEventQueue interfaces
@@ -303,6 +311,9 @@ private:
     IConnectionHandler  *   handler_ = NULL;
     IRPCStub            *   connect_rpc_ = NULL;
     int32_t                 connect_timer_id_ = 0;
+    int32_t                 restart_verify_timer_id_ = 0;
+    uint32_t                restart_verify_count_ = 0;
+    int64_t                 network_handle_ = 0;
     UDPSenderGroup      *   udp_socket_ = NULL;
     bool                    webtransport_ = false;
     // Asynch state
@@ -311,12 +322,14 @@ private:
     uint32_t				state_line_;
     uint32_t				close_status_;
     std::string             conn_close_msg_;
+    std::string             cert_verify_error_;
     std::atomic_bool        keep_working_;
     // stats
     ssize_t                 last_snd_sum    = 0;
     ssize_t                 snd_sum         = 0;
     uint64_t                last_snd_ts     = 0;
     uint64_t                wrote_counter   = 0;
+    X509                *   root_ca_        = nullptr;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -343,6 +356,7 @@ class SMPConnector
             , c_cong_ctl('b'), pacing_on(0), idle_time_out(0)
             , linger_on(0), log_level('d'), alpn(NULL), ping_on(false)
             , ping_interval(0), log_file(NULL), active_connection_id_limit(0)
+            , ca_cert_pem(NULL), ca_cert_pem_len(0)
         {
             memset(&engine_ssl_config, 0, sizeof(engine_ssl_config));
         }
@@ -363,11 +377,13 @@ class SMPConnector
         uint8_t                     linger_on;
         uint8_t                     log_level;
         xqc_engine_ssl_config_t     engine_ssl_config;
-        LPCSTR                      alpn;
+        std::vector<std::string>    alpn;
         bool                        ping_on;
         uint64_t                    ping_interval;
         LPCSTR                      log_file;
         uint64_t                    active_connection_id_limit;
+        LPCSTR                      ca_cert_pem;
+        size_t                      ca_cert_pem_len;
 
         BCRESULT		Init(BCFObject* pConfig);
 
@@ -516,6 +532,13 @@ private:
                         const struct sockaddr* peer_addr,
                         socklen_t peer_addrlen,
                         void* user_data);
+    static ssize_t  conn_write_socket_ex_cb(
+                        uint64_t path_id,
+                        const unsigned char* buf,
+                        size_t size,
+                        const struct sockaddr* peer_addr,
+                        socklen_t peer_addrlen,
+                        void* conn_user_data);
     static void     on_write_log(
                         xqc_log_level_t lvl,
                         const void* buf,
@@ -571,6 +594,8 @@ public:
     // Stats
     std::atomic<size_t>		total_allocated_conns_;
     std::atomic<size_t>		total_freed_conns_;
+    // Self-signed root CA for cert verification
+    X509                    *   root_ca_ = nullptr;
 };
 
 #endif // SMPCONNECTOR_H_INCLUDED__

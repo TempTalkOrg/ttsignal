@@ -38,6 +38,8 @@ std::string connection_sym("connection");
 std::string stream_created_sym("streamCreated");
 std::string stream_closed_sym("streamClosed");
 std::string restart_sym("restart");
+std::string stream_data_acked_sym("streamDataAcked");
+std::string stream_data_sent_sym("streamDataSent");
 
 std::atomic<bool> G_isElectron(false);
 

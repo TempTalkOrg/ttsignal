@@ -524,6 +524,9 @@ public:
 	BCRESULT				GetSockName(BCSockAddrS *addressp);
 	void					Cancel(BCTask *task, uint32_t how);
 	BCSocketTypeE		    GetType();
+#ifdef OS_ANDROID
+	int						GetFd() const { return m_nFD; }
+#endif
 	BOOL					IsBound();
 	void					IPv6only(BOOL yes);
 	void					SetName(const char *szName, void *pTag);

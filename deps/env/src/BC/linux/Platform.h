@@ -100,9 +100,15 @@
 	#define kPlatformNameString     "GNU/Linux"
 
 	#if __LP64__
+		#if defined(OS_MAC) || defined(OS_IOS)
+		#define _64BITARG_  "ll"
+		#define _S64BITARG_ "lld"
+		#define _U64BITARG_ "llu"
+		#else
 		#define _64BITARG_  "l"
 		#define _S64BITARG_ "ld"
 		#define _U64BITARG_ "lu"
+		#endif
 		#define _LLBITARG_  "ll"
 		#define _SLLBITARG_ "lld"
 		#define _ULLBITARG_ "llu"

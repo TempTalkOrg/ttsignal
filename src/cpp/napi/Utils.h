@@ -6,9 +6,9 @@
 #ifndef NAPI_UTILS_H_INCLUDED__
 #define NAPI_UTILS_H_INCLUDED__
 
-#include <vector>
 #include <string>
 #include <napi.h>
+#include <BC/BCFCodec.h>
 
 namespace BC
 {
@@ -45,6 +45,8 @@ extern std::string 		connection_sym;
 extern std::string 		stream_created_sym;
 extern std::string 		stream_closed_sym;
 extern std::string 		restart_sym;
+extern std::string 		stream_data_acked_sym;
+extern std::string 		stream_data_sent_sym;
 
 
 void						

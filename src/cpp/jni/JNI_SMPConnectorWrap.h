@@ -53,7 +53,7 @@ protected:
 							jobject obj, 
 							jlong handle, 
 							jlong packet);
-	static	void		_Restart(JNIEnv* env, jobject obj, jlong handle);
+	static	void		_Restart(JNIEnv* env, jobject obj, jlong handle, jlong networkHandle);
 	static	void		_Close(JNIEnv* env, jobject obj, jlong handle);
 	static	void		_CloseStream(JNIEnv* env, jobject obj, jlong handle, jint nStreamId);
 	static	void		_Destroy(JNIEnv* env, jobject, jlong handle);
@@ -65,6 +65,15 @@ private:
 	void				OnExecDone(IRPCStub *pStub) override;
 	void 				OnStreamCreated(uint32_t nStreamId) override;
 	void 				OnStreamClosed(uint32_t nStreamId) override;
+	void				OnStreamDataAcked(
+							uint32_t nStreamId,
+							xqc_usec_t ack_delay_time,
+							size_t acked_bytes,
+							size_t inflight_bytes) override;
+	void				OnStreamDataSent(
+							uint32_t nStreamId, 
+							uint32_t nTransId,
+							size_t size) override;
 	void				OnRecvCmd(
 							const SMPHeader &refHeader,
 							const char* lpszCmd, 

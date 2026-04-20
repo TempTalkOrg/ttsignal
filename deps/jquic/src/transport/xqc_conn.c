@@ -1882,9 +1882,6 @@ xqc_need_padding(xqc_connection_t *conn, xqc_packet_out_t *packet_out)
             }
         }
 
-    } else if (packet_out->po_pkt.pkt_pns == XQC_PNS_HSK) {
-        ret = XQC_TRUE;
-
     } else if ((packet_out->po_frame_types & XQC_FRAME_BIT_PATH_CHALLENGE)
                || (packet_out->po_frame_types & XQC_FRAME_BIT_PATH_RESPONSE)
                || (packet_out->po_flag & XQC_POF_PMTUD_PROBING))
@@ -5583,12 +5580,25 @@ xqc_conn_send_path_challenge(xqc_connection_t *conn, xqc_path_ctx_t *path)
         goto end;
 
     } else {
+        char local_addr_str[INET6_ADDRSTRLEN] = {0};
+        char peer_addr_str[INET6_ADDRSTRLEN] = {0};
+        struct sockaddr_in *sa_local = (struct sockaddr_in *)path->local_addr;
+        struct sockaddr_in *sa_peer = (struct sockaddr_in *)path->rebinding_addr;
+        xqc_local_addr_str((struct sockaddr*)sa_local, path->local_addrlen,
+                           local_addr_str, sizeof(local_addr_str));
+        xqc_peer_addr_str((struct sockaddr*)sa_peer, path->rebinding_addrlen,
+                          peer_addr_str, sizeof(peer_addr_str));
         xqc_log(conn->log, XQC_LOG_INFO,
                 "|<==|conn:%p|pkt_num:%ui|size:%ud|sent:%z|pkt_type:%s|frame:%s|inflight:%ud|now:%ui|",
                 conn, packet_out->po_pkt.pkt_num, packet_out->po_used_size, sent,
                 xqc_pkt_type_2_str(packet_out->po_pkt.pkt_type),
                 xqc_frame_type_2_str(packet_out->po_frame_types, conn->log_buf, sizeof(conn->log_buf)),
                 path->path_send_ctl->ctl_bytes_in_flight, now);
+        xqc_log(conn->log, XQC_LOG_DEBUG,
+                "|path_challenge detail|local:%s:%d|peer:%s:%d|path_addr:%s|",
+                local_addr_str, ntohs(sa_local->sin_port),
+                peer_addr_str, ntohs(sa_peer->sin_port),
+                xqc_path_addr_str(path));
         xqc_log_event(conn->log, TRA_DATAGRAMS_SENT, ret);
         xqc_log_event(conn->log, TRA_PACKET_SENT, packet_out);
     }
@@ -5599,6 +5609,87 @@ xqc_conn_send_path_challenge(xqc_connection_t *conn, xqc_path_ctx_t *path)
 end:
     xqc_send_queue_remove_send(&packet_out->po_list);
     xqc_send_queue_insert_free(packet_out, &conn->conn_send_queue->sndq_free_packets, conn->conn_send_queue);
+    return ret;
+}
+
+xqc_int_t
+jqc_conn_local_addr_changed(xqc_connection_t *conn,
+    const struct sockaddr *local_addr, socklen_t local_addrlen)
+{
+    xqc_int_t ret;
+    xqc_path_ctx_t *path;
+
+    if (conn == NULL || local_addr == NULL || local_addrlen == 0) {
+        return -XQC_EPARAM;
+    }
+
+    ret = xqc_memcpy_with_cap(conn->local_addr, sizeof(conn->local_addr),
+                              local_addr, local_addrlen);
+    if (ret != XQC_OK) {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|local addr too large|addr_len:%d|", (int)local_addrlen);
+        return ret;
+    }
+    conn->local_addrlen = local_addrlen;
+
+    path = conn->conn_initial_path;
+    if (path == NULL) {
+        xqc_log(conn->log, XQC_LOG_WARN, "|no initial path|");
+        return XQC_OK;
+    }
+
+    {
+        char old_local_str[INET6_ADDRSTRLEN] = {0};
+        char new_local_str[INET6_ADDRSTRLEN] = {0};
+        char peer_str[INET6_ADDRSTRLEN] = {0};
+        struct sockaddr_in *sa_old = (struct sockaddr_in *)path->local_addr;
+        struct sockaddr_in *sa_new = (struct sockaddr_in *)local_addr;
+        struct sockaddr_in *sa_peer = (struct sockaddr_in *)path->peer_addr;
+        xqc_local_addr_str((struct sockaddr*)sa_old, path->local_addrlen,
+                           old_local_str, sizeof(old_local_str));
+        xqc_local_addr_str((struct sockaddr*)sa_new, local_addrlen,
+                           new_local_str, sizeof(new_local_str));
+        xqc_peer_addr_str((struct sockaddr*)sa_peer, path->peer_addrlen,
+                          peer_str, sizeof(peer_str));
+        xqc_log(conn->log, XQC_LOG_DEBUG,
+                "|local addr changed|conn:%p|path:%ui|old_local:%s:%d|new_local:%s:%d|peer:%s:%d|",
+                conn, path->path_id,
+                old_local_str, ntohs(sa_old->sin_port),
+                new_local_str, ntohs(sa_new->sin_port),
+                peer_str, ntohs(sa_peer->sin_port));
+    }
+
+    xqc_memcpy(path->local_addr, local_addr, local_addrlen);
+    path->local_addrlen = local_addrlen;
+    path->addr_str_len = 0;
+
+    /* reset idle timer to prevent timeout during network switch */
+    xqc_usec_t now = xqc_monotonic_timestamp();
+    xqc_timer_set(&conn->conn_timer_manager, XQC_TIMER_CONN_IDLE,
+                  now, xqc_conn_get_idle_timeout(conn) * 1000);
+
+    if (conn->conn_state < XQC_CONN_STATE_ESTABED) {
+        return XQC_OK;
+    }
+
+    if (conn->transport_cbs.write_socket_ex == NULL) {
+        xqc_log(conn->log, XQC_LOG_WARN,
+                "|write_socket_ex not set, skip PATH_CHALLENGE|");
+        return XQC_OK;
+    }
+
+    /* store peer_addr into rebinding_addr so xqc_conn_send_path_challenge
+     * sends the challenge to the server's address */
+    xqc_memcpy(path->rebinding_addr, path->peer_addr, path->peer_addrlen);
+    path->rebinding_addrlen = path->peer_addrlen;
+
+    ret = xqc_conn_send_path_challenge(conn, path);
+    if (ret != XQC_OK) {
+        xqc_log(conn->log, XQC_LOG_ERROR,
+                "|send PATH_CHALLENGE failed|ret:%d|", ret);
+        path->rebinding_addrlen = 0;
+    }
+
     return ret;
 }
 

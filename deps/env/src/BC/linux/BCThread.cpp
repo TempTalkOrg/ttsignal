@@ -68,7 +68,7 @@ BCMutex::BCMutex(void)
 
 BCMutex::~BCMutex(void)
 {
-    THROW_ERRORS(pthread_mutex_destroy(&posix_mutex));
+    pthread_mutex_destroy(&posix_mutex);
 }
 
 
@@ -90,7 +90,7 @@ BCCondition::BCCondition(BCMutex* m) : m_pMutex(m)
 
 BCCondition::~BCCondition(void)
 {
-    THROW_ERRORS(pthread_cond_destroy(&posix_cond));
+    pthread_cond_destroy(&posix_cond);
 }
 
 void
@@ -1071,7 +1071,7 @@ public:
   }
   inline ~BCThreadDummy()
   {
-    THROW_ERRORS(pthread_setspecific(self_key, 0));
+    pthread_setspecific(self_key, 0);
   }
 };
 //**********************************************************************************************************************

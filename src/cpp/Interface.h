@@ -164,6 +164,15 @@ public:
 	virtual void		OnExecDone(IRPCStub *pStub)			= 0;
 	virtual void 		OnStreamCreated(uint32_t nStreamId) = 0;
 	virtual void		OnStreamClosed(uint32_t nStreamId)	= 0;
+	virtual void		OnStreamDataAcked(
+							uint32_t nStreamId,
+							xqc_usec_t ack_delay_time,
+							size_t acked_bytes,
+							size_t inflight_bytes)			= 0;
+	virtual void		OnStreamDataSent(
+							uint32_t nStreamId, 
+							uint32_t nTransId,
+							size_t size)					= 0;
 	virtual void		OnRecvCmd(
 							const SMPHeader &refHeader,
 							const char* lpszCmd, 

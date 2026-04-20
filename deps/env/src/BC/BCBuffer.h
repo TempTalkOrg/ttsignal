@@ -113,6 +113,8 @@ public:
 	uint32_t		Peek(void *pBuffer, uint32_t nSize);
 	uint32_t		RemainingLength() const;
 	void		*	ReadBlock(uint32_t nSizeToRead, uint32_t &refReadSize);
+	/** Zero-copy view like ReadBlock without advancing m_nCurrent; call Forward(sentBytes) after a successful send. */
+	void		*	PeekBlock(uint32_t nSizeToRead, uint32_t &refReadSize);
 	void		*	GetWritableBlock(uint32_t &refBlockSize);
 	void			UngetWritableBlock(uint32_t nBlockSize);
 	uint32_t		UsedLength() const;

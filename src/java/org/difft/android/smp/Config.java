@@ -1,15 +1,15 @@
-///////////////////////////////////////////////////////////////////////////////
+/// ////////////////////////////////////////////////////////////////////////////
 // file : Config.java
 // author : antoniozhou
-///////////////////////////////////////////////////////////////////////////////
+/// ////////////////////////////////////////////////////////////////////////////
 
 package org.difft.android.smp;
 
 
 public class Config {
-     public interface LogHandler {
-         public void log(int level, String msg);
-     }
+    public interface LogHandler {
+        public void log(int level, String msg);
+    }
 
     // Connector use config properties
     public String hostname = "localhost";
@@ -25,7 +25,7 @@ public class Config {
     public int timerThreads = 4;
     // connection idle time out in milliseconds
     public int idleTimeOut = 20000;
-    public String alpn = "ttsignal"; 
+    public String alpn = "ttsignal";
     public int maxConnections = 1000;
     public int congestCtrl = 'B';
     // ping on switch
@@ -44,6 +44,10 @@ public class Config {
     public int logLevel = 0;
     // number of senders
     public int numOfSenders = 1;
+    // Logical hostname for TLS SNI and certificate hostname verification (IP direct scenario)
+    public String serverHost = "";
+    // Self-signed root CA certificate in PEM format for custom certificate chain verification
+    public String caCertPem = "";
 
     public Config() {
         // Default constructor

@@ -1015,16 +1015,21 @@ xqc_ssl_cert_verify_cb(int ok, X509_STORE_CTX *store_ctx)
     }
 
     int err_code = X509_STORE_CTX_get_error(store_ctx);
-    if (err_code != X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY
-        && err_code != X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY
-        && !((tls->cert_verify_flag & XQC_TLS_CERT_FLAG_ALLOW_SELF_SIGNED) != 0
-             && XQC_TLS_SELF_SIGNED_CERT(err_code)))
-    {
-        xqc_log(tls->log, XQC_LOG_ERROR, "|certificate verify failed with err_code:%d|", err_code);
-        if (tls->cbs->error_cb) {
-            tls->cbs->error_cb(err_code, tls->user_data);
+
+    if (tls->cbs->cert_verify_cb == NULL) {
+        if (err_code != X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY
+            && err_code != X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT
+            && !((tls->cert_verify_flag & XQC_TLS_CERT_FLAG_ALLOW_SELF_SIGNED) != 0
+                 && XQC_TLS_SELF_SIGNED_CERT(err_code)))
+        {
+            xqc_log(tls->log, XQC_LOG_ERROR,
+                "|certificate verify failed with err_code:%d|cert_verify_flag:%d|",
+                err_code, tls->cert_verify_flag);
+            if (tls->cbs->error_cb) {
+                tls->cbs->error_cb(err_code, tls->user_data);
+            }
+            return XQC_SSL_FAIL;
         }
-        return XQC_SSL_FAIL;
     }
 
     /* get certs array */
@@ -1048,6 +1053,33 @@ xqc_ssl_cert_verify_cb(int ok, X509_STORE_CTX *store_ctx)
 
         } else {
             verify_res = XQC_SSL_SUCCESS;
+        }
+    }
+
+    if (verify_res != XQC_SSL_SUCCESS) {
+        X509 *current_cert = X509_STORE_CTX_get_current_cert(store_ctx);
+        if (current_cert) {
+            char subj[256] = {0};
+            char issuer[256] = {0};
+            X509_NAME_oneline(X509_get_subject_name(current_cert), subj, sizeof(subj));
+            X509_NAME_oneline(X509_get_issuer_name(current_cert), issuer, sizeof(issuer));
+            int depth = X509_STORE_CTX_get_error_depth(store_ctx);
+            xqc_log(tls->log, XQC_LOG_ERROR,
+                "|cert verify failed|err:%d|depth:%d|subject:%s|issuer:%s|",
+                err_code, depth, subj, issuer);
+        }
+        STACK_OF(X509) *chain = X509_STORE_CTX_get0_chain(store_ctx);
+        if (chain) {
+            int chain_len = sk_X509_num(chain);
+            for (int ci = 0; ci < chain_len; ci++) {
+                X509 *c = sk_X509_value(chain, ci);
+                char cs[256] = {0};
+                char ci_issuer[256] = {0};
+                X509_NAME_oneline(X509_get_subject_name(c), cs, sizeof(cs));
+                X509_NAME_oneline(X509_get_issuer_name(c), ci_issuer, sizeof(ci_issuer));
+                xqc_log(tls->log, XQC_LOG_ERROR,
+                    "|cert verify failed|chain[%d] subject:%s issuer:%s|", ci, cs, ci_issuer);
+            }
         }
     }
 

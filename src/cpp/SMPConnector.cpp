@@ -6,7 +6,12 @@
 #include "StdAfx.h"
 #include <time.h>
 #include <fcntl.h>
-#include <openssl/rand.h> // for RAND_bytes
+#include <openssl/rand.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
+#include <openssl/x509_vfy.h>
+#include <openssl/bio.h>
 #include <HTTP/HTTPProtocol.h>
 #include "SMPConnector.h"
 #include "Runtime.h"
@@ -66,38 +71,20 @@ BCRESULT SMPStream::Create(
 
 int SMPStream::Send(const void *data, size_t size)
 {
-    ssize_t ret = 0;
-
     if (!stream_)
     {
         LogQ(conn_->connector_->logger_ctx_, _ERROR_, "stream_send: stream is NULL, stream_id:%" _S32BITARG_, stream_id_);
         return -1;
     }
-    ret = xqc_stream_send(stream_, (unsigned char*)data, size, 0);
-    if (ret == -XQC_EAGAIN) 
-    {
-        LogQ(conn_->connector_->logger_ctx_, _DEBUG_, "stream_send: EAGAIN, stream_id:%" _S32BITARG_ " size:%zu", stream_id_, size);
-    } 
-    else if (ret < 0) 
-    {
-        LogQ(conn_->connector_->logger_ctx_, _ERROR_, "stream_send: error %zd, stream_id:%" _S32BITARG_ " size:%zu", ret, stream_id_, size);
-        return 0;
-    }
-
-    return ret;
+    return xqc_stream_send(stream_, (unsigned char*)data, size, 0);
 }
 
 BCRESULT SMPStream::SendPacket(SMPacketPtr pkt)
 {
     if (pkt->packed_jmp_data)
     {
-        BufferPtr payload(pkt->packed_jmp_data->RefClone());
-        void* data;
-        uint32_t nReadSize = INFINITE;
-        while ((data = payload->ReadBlock(INFINITE, nReadSize)) && nReadSize > 0)
-        {
-            Send(data, nReadSize);
-        }
+        send_buff_list_.push_back(pkt);
+        _SendBuffList();
     }
     else
     {
@@ -156,6 +143,12 @@ int SMPStream::OnRead()
     return 0;
 }
 
+int SMPStream::OnWriteNotify()
+{
+    _SendBuffList();
+    return 0;
+}
+
 void SMPStream::OnClosing()
 {
     
@@ -177,10 +170,7 @@ void SMPStream::OnPacketAcked(
     size_t acked_bytes,
     size_t inflight_bytes)
 {
-    if (inflight_bytes < 16384)
-    {
-        //Send();
-    }
+    // LogQ(conn_->connector_->logger_ctx_, _DEBUG_, "stream_packet_acked: ack_delay_time:%" _U64BITARG_ " acked_bytes:%" _U64BITARG_ " inflight_bytes:%" _U64BITARG_, ack_delay_time, acked_bytes, inflight_bytes);
 }
 
 void SMPStream::OnPacketParsed(
@@ -197,6 +187,43 @@ void SMPStream::OnPacketParsed(
 void SMPStream::OnDataPacked(void* payload, size_t payload_size)
 {
     Send(payload, payload_size);
+}
+
+void SMPStream::_SendBuffList()
+{
+    while (!send_buff_list_.empty())
+    {
+        SMPacketPtr pkt = send_buff_list_.front();
+        BufferPtr buff = pkt->packed_jmp_data;
+        void* data;
+        uint32_t nPeekSize = INFINITE;
+        while ((data = buff->PeekBlock(INFINITE, nPeekSize)) && nPeekSize > 0)
+        {
+            int ret = Send(data, nPeekSize);
+            if (ret < 0)
+            {
+                return;
+            }
+            if (ret == 0)
+            {
+                return;
+            }
+            if ((uint32_t)ret > nPeekSize)
+            {
+                LogQ(conn_->connector_->logger_ctx_, _ERROR_,
+                    "stream_send: ret>nPeekSize stream_id:%" _S32BITARG_ " ret:%d nPeek:%u",
+                    stream_id_, ret, nPeekSize);
+                return;
+            }
+            buff->Forward((uint32_t)ret);
+        }
+        if (conn_ && conn_->handler_)
+        {
+            conn_->handler_->OnStreamDataSent(stream_id_, 
+                pkt->trans_id, pkt->origion_data->UsedLength());
+        }
+        send_buff_list_.pop_front();
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -240,7 +267,14 @@ BCRESULT H3Stream::SendRequest()
     Json::Value root;
     KBPool pool;
 
-    std::string authority = conn_->host_ + ":" + std::to_string(conn_->port_);
+    const char* logical_host = conn_->config_.server_host;
+    if (!logical_host || strlen(logical_host) == 0) {
+        logical_host = conn_->connector_->config_.server_host;
+    }
+    if (!logical_host || strlen(logical_host) == 0) {
+        logical_host = conn_->host_.c_str();
+    }
+    std::string authority = std::string(logical_host) + ":" + std::to_string(conn_->port_);
     xqc_http_header_t method = {
         .name = {.iov_base = (char*)":method", .iov_len = 7 },
             .value = {.iov_base = (char*)"CONNECT", .iov_len = 7 },
@@ -267,7 +301,7 @@ BCRESULT H3Stream::SendRequest()
     headers.push_back(scheme);
     xqc_http_header_t host_hdr = {
         .name = {.iov_base = kHost.Ptr, .iov_len = kHost.Len},
-        .value = {.iov_base = (char*)conn_->host_.c_str(), .iov_len = conn_->host_.length()},
+        .value = {.iov_base = (char*)logical_host, .iov_len = strlen(logical_host)},
         .flags = 0,
     };
     headers.push_back(host_hdr);
@@ -477,6 +511,7 @@ SMPConnection::Config::Config()
     , c_cong_ctl('b'), pacing_on(false), idle_time_out(0), ping_on(false)
     , linger_on(false), ping_interval(0), active_connection_id_limit(0)
     , alpn(NULL), device_type(0)
+    , ca_cert_pem(NULL), ca_cert_pem_len(0)
 {
     RAND_bytes((uint8_t*)cid_tag, SMP_CID_TAG_LEN);
 }
@@ -570,6 +605,12 @@ BCRESULT SMPConnection::Config::Init(BCFObject* pConfig)
         }
         memcpy(cid_tag, cidTag, SMP_CID_TAG_LEN);
     }
+    pVar = pConfig->Get("ca_cert_pem");
+    if (IS_BCF_STRING(pVar))
+    {
+        ca_cert_pem = pool_.Strdup(GET_BCF_STRING(pVar));
+        ca_cert_pem_len = strlen(ca_cert_pem);
+    }
     return BC_R_SUCCESS;
 }
 
@@ -602,6 +643,11 @@ SMPConnection::SMPConnection()
 
 SMPConnection::~SMPConnection()
 {
+    if (root_ca_)
+    {
+        X509_free(root_ca_);
+        root_ca_ = nullptr;
+    }
 }
 
 BCRESULT SMPConnection::Create(
@@ -620,6 +666,11 @@ BCRESULT SMPConnection::Create(
         LogQ(connector->logger_ctx_, _ERROR_, "invalid arguments: invalid connector or handler or config");
         return BC_R_INVALIDARG;
     }
+    config_.Init(pConfig);
+    if (config_.alpn == NULL) {
+        LogQ(connector->logger_ctx_, _ERROR_, "invalid arguments: invalid alpn");
+        return BC_R_INVALIDARG;
+    }
     pTaskMgr = Runtime::RandomTaskMgr();
     pTimerMgr = Runtime::RandomTimerMgr();
     udp_socket_ = new UDPSenderGroup();
@@ -628,6 +679,19 @@ BCRESULT SMPConnection::Create(
         return BC_R_NOMEMORY;
     }
     config_.Init(pConfig);
+    if (config_.ca_cert_pem && config_.ca_cert_pem_len > 0)
+    {
+        BIO *bio = BIO_new_mem_buf(config_.ca_cert_pem, (int)config_.ca_cert_pem_len);
+        if (bio)
+        {
+            root_ca_ = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+            BIO_free(bio);
+        }
+        if (!root_ca_)
+        {
+            LogQ(connector->logger_ctx_, _ERROR_, "SMPConnection: failed to parse per-connection ca_cert_pem");
+        }
+    }
     result = udp_socket_->Create(connector->logger_ctx_, pTaskMgr, pTimerMgr, 
         Runtime::SocketMgr(), pConfig, this, false, false);
     if (result != BC_R_SUCCESS)
@@ -740,18 +804,19 @@ BCRESULT SMPConnection::SendPacket(SMPacketPtr pkt)
     return BC_R_NETDOWN;
 }
 
-void SMPConnection::Restart()
+void SMPConnection::Restart(int64_t networkHandle)
 {
     if (keep_working_)
     {
-        PostTask([this] {
+        PostTask([this, networkHandle] {
             if (_CloseCheck())
             {
                 return;
             }
+            network_handle_ = networkHandle;
             if (udp_socket_)
             {
-                udp_socket_->Restart();
+                udp_socket_->Restart(networkHandle);
             }
             _CloseCheck();
         });
@@ -847,12 +912,13 @@ BCRESULT SMPConnection::Connect_Internal()
     if (config_.active_connection_id_limit) {
         conn_settings.active_connection_id_limit = config_.active_connection_id_limit;
     }
-    if (config_.alpn == NULL) {
-        config_.alpn = config_.Strdup(connector_->config_.alpn);
-    }
 
     xqc_conn_ssl_config_t conn_ssl_config;
     memset(&conn_ssl_config, 0, sizeof(conn_ssl_config));
+    if (root_ca_ || connector_->root_ca_) {
+        conn_ssl_config.cert_verify_flag = XQC_TLS_CERT_FLAG_NEED_VERIFY
+                                         | XQC_TLS_CERT_FLAG_ALLOW_SELF_SIGNED;
+    }
 
     const xqc_cid_t *cid;
     int no_crypt = 0;
@@ -881,8 +947,13 @@ BCRESULT SMPConnection::Connect_Internal()
         return result;
     }
 
+    const char *sni_host = (config_.server_host && strlen(config_.server_host) > 0)
+                         ? config_.server_host
+                         : (host_.length() > 0
+                            ? host_.c_str()
+                            : connector_->config_.server_host);
     cid = jqc_connect(connector_->engine_, &conn_settings, NULL,
-                      0, connector_->config_.server_host, no_crypt,
+                      0, sni_host, no_crypt,
                       &conn_ssl_config, (sockaddr*)&peer_addr_,
                       peer_addrlen_, config_.alpn, &timer_cbs, this);
     if (cid == NULL) {
@@ -971,6 +1042,7 @@ BCRESULT SMPConnection::SendPacket_Internal(SMPacketPtr pkt)
 {
     if (stream_map_.find(pkt->stream_id) != stream_map_.end())
     {
+        pkt->PackPacket();
         stream_map_[pkt->stream_id]->SendPacket(pkt);
         return BC_R_SUCCESS;
     }
@@ -1163,6 +1235,10 @@ void SMPConnection::OnPacketAcked(
     {
         stream_map_[stream_id]->OnPacketAcked(ack_delay_time, 
             acked_bytes, inflight_bytes);
+        if (handler_)
+        {
+            handler_->OnStreamDataAcked(stream_id, ack_delay_time, acked_bytes, inflight_bytes);
+        }
     }
 }
 
@@ -1215,12 +1291,11 @@ SMPConnection::WritePacket(
         peerAddr.length = peer_addrlen;
         result = udp_socket_->Send(peerAddr, buf, size);
         if (result != BC_R_SUCCESS && result != BC_R_INPROGRESS) {
-            res = XQC_SOCKET_ERROR;
+            res = XQC_SOCKET_EAGAIN;
         }
         else
         {
             res = size;
-            //LogBin(connector_->logger_ctx_, _LOCAL_, buf, size);
             wrote_counter++;
         }
     } while (0);
@@ -1228,19 +1303,10 @@ SMPConnection::WritePacket(
     if (res > 0) {
         if ((bc_time_now() - last_snd_ts) > 200000)
         {
-            //LogQ(connector_->logger_ctx_, _DEBUG_, "sending rate: %.3f Kbps\n", (snd_sum - last_snd_sum) *
-            //    8.0 * 1000 / (time_now() - last_snd_ts));
             last_snd_ts = bc_time_now();
             last_snd_sum = snd_sum;
         }
-        //LogQ(connector_->logger_ctx_, _DEBUG_, "WritePacket(id:%u, conn:%p) ", id_, conn_);
     }
-    else
-    {
-        LogQ(connector_->logger_ctx_, _ERROR_, "WritePacket(write error : %d) ", res);
-        _set_state(this, CONN_STATE_FREED, BC_R_NETDOWN);
-    }
-    _CloseCheck();
 
     return res;
 }
@@ -1295,6 +1361,12 @@ void SMPConnection::OnRecvData(BCBuffer* pBuffer, BCSockAddrS& refSrcAddr)
     {
         return;
     }
+    if (restart_verify_timer_id_ > 0)
+    {
+        UnscheduleTask(restart_verify_timer_id_);
+        restart_verify_timer_id_ = 0;
+        restart_verify_count_ = 0;
+    }
     if (udp_socket_)
     {
         BCSockAddrS localAddr;
@@ -1342,6 +1414,31 @@ void SMPConnection::OnRecvData(BCBuffer* pBuffer, BCSockAddrS& refSrcAddr)
     _CloseCheck();
 }
 
+void SMPConnection::OnCheckAvailable()
+{
+    if (keep_working_)
+    {
+        PostTask([this] {
+            if (_CloseCheck())
+            {
+                return;
+            }
+            if (conn_ && udp_socket_)
+            {
+                BCSockAddrS localAddr;
+                udp_socket_->GetSockName(localAddr);
+                xqc_int_t ret = jqc_conn_local_addr_changed(conn_,
+                    (struct sockaddr *)&localAddr.type, localAddr.length);
+                if (ret != XQC_OK)
+                {
+                    LogQ(connector_->logger_ctx_, _ERROR_, "%s: local addr changed err\n", __FUNCTION__);
+                }
+            }
+            _CloseCheck();
+        });
+    }
+}
+
 void SMPConnection::OnRestart(BCRESULT result)
 {
     PostTask([this, result] {
@@ -1351,11 +1448,59 @@ void SMPConnection::OnRestart(BCRESULT result)
         }
         if (result == BC_R_SUCCESS && udp_socket_)
         {
+            BCSockAddrS peerAddr;
+            memcpy(&peerAddr, &peer_addr_, peer_addrlen_);
+            peerAddr.length = peer_addrlen_;
+            udp_socket_->Connect(peerAddr);
+
             BCSockAddrS localAddr;
             udp_socket_->GetSockName(localAddr);
             local_addrlen_ = localAddr.length;
             memcpy(&local_addr_, &localAddr.type, local_addrlen_);
             udp_socket_->StartRecv();
+
+            {
+                char local_str[128];
+                bc_sockaddr_format(&localAddr, local_str, sizeof(local_str));
+                LogQ(connector_->logger_ctx_, _DEBUG_,
+                    "OnRestart: socket local_addr=%s, addrlen=%d, network_handle=%lld",
+                    local_str, (int)local_addrlen_, (long long)network_handle_);
+            }
+
+            xqc_connection_t *qconn = conn_ ? conn_ : (h3_conn_ ? xqc_h3_conn_get_xqc_conn(h3_conn_) : NULL);
+            if (qconn) {
+                jqc_conn_local_addr_changed(qconn,
+                    (struct sockaddr *)&local_addr_, local_addrlen_);
+            }
+
+            if (restart_verify_timer_id_ > 0)
+            {
+                UnscheduleTask(restart_verify_timer_id_);
+                restart_verify_timer_id_ = 0;
+            }
+            restart_verify_count_++;
+            ScheduleTask(restart_verify_timer_id_, [this](int32_t timer_id) {
+                if (_CloseCheck())
+                {
+                    return;
+                }
+                UnscheduleTask(restart_verify_timer_id_);
+                restart_verify_timer_id_ = 0;
+                if (restart_verify_count_ < 3 && udp_socket_)
+                {
+                    LogQ(connector_->logger_ctx_, _INFO_,
+                        "restart verify timeout, retry %u", restart_verify_count_);
+                    udp_socket_->Restart(network_handle_);
+                }
+                else
+                {
+                    LogQ(connector_->logger_ctx_, _INFO_,
+                        "restart verify timeout, gave up after %u retries", restart_verify_count_);
+                    restart_verify_count_ = 0;
+                }
+                _CloseCheck();
+            }, 3000000, false);
+
             if (handler_)
             {
                 char local_addr_str_[128];
@@ -1512,6 +1657,12 @@ bool SMPConnection::_CloseCheck()
         {
             UnscheduleTask(connect_timer_id_);
             connect_timer_id_ = 0;
+        }
+        if (restart_verify_timer_id_ > 0)
+        {
+            UnscheduleTask(restart_verify_timer_id_);
+            restart_verify_timer_id_ = 0;
+            restart_verify_count_ = 0;
         }
         state_ = CONN_STATE_CLOSING_QUIC;
     }
@@ -1676,7 +1827,10 @@ BCRESULT SMPConnector::Config::Init(BCFObject* pConfig)
     pVar = pConfig->Get("alpn");
     if (IS_BCF_STRING(pVar))
     {
-        alpn = pool_.Strdup(GET_BCF_STRING(pVar));
+        std::string alpn_str = GET_BCF_STRING(pVar).c_str();
+        std::vector<std::string> alpn_list;
+        SplitString(alpn_str, ',', &alpn_list);
+        alpn.assign(alpn_list.begin(), alpn_list.end());
     }
     pVar = pConfig->Get("ping_on");
     if (IS_BCF_BOOL(pVar))
@@ -1697,6 +1851,12 @@ BCRESULT SMPConnector::Config::Init(BCFObject* pConfig)
     if (IS_BCF_NUMBER(pVar))
     {
         active_connection_id_limit = (uint64_t)GET_BCF_INT(pVar);
+    }
+    pVar = pConfig->Get("ca_cert_pem");
+    if (IS_BCF_STRING(pVar))
+    {
+        ca_cert_pem = pool_.Strdup(GET_BCF_STRING(pVar));
+        ca_cert_pem_len = strlen(ca_cert_pem);
     }
     return BC_R_SUCCESS;
 }
@@ -1725,6 +1885,11 @@ SMPConnector::SMPConnector()
 
 SMPConnector::~SMPConnector()
 {
+    if (root_ca_)
+    {
+        X509_free(root_ca_);
+        root_ca_ = nullptr;
+    }
 }
 
 BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
@@ -1737,10 +1902,26 @@ BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
 
     handler_ = pHandler;
     config_.Init(pConfig);    
-	if (!config_.alpn)
+	if (config_.alpn.empty())
     {
         LogQ(logger_ctx_, _ERROR_, "invalid arguments: invalid alpn");
         return BC_R_INVALIDARG;
+    }
+    if (config_.ca_cert_pem && config_.ca_cert_pem_len > 0)
+    {
+        BIO *bio = BIO_new_mem_buf(config_.ca_cert_pem, (int)config_.ca_cert_pem_len);
+        if (!bio)
+        {
+            LogQ(logger_ctx_, _ERROR_, "failed to allocate BIO for ca_cert_pem");
+            return BC_R_NOMEMORY;
+        }
+        root_ca_ = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+        BIO_free(bio);
+        if (!root_ca_)
+        {
+            LogQ(logger_ctx_, _ERROR_, "failed to parse ca_cert_pem");
+            return BC_R_INVALIDARG;
+        }
     }
     if (config_.log_file) {
         logger_ctx_ = AddFileLogAppender(config_.log_file, _FINEST_, true, true);
@@ -1787,7 +1968,7 @@ BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
         .stateless_reset = on_stateless_reset,
         .write_socket = conn_write_socket_cb,
         .write_mmsg = NULL,
-        .write_socket_ex = NULL,
+        .write_socket_ex = conn_write_socket_ex_cb,
         .write_mmsg_ex = NULL,
         .conn_update_cid_notify = on_conn_update_cid_notify,
         .save_token = on_conn_save_token,
@@ -1889,7 +2070,12 @@ BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
     };
 
     /* register raw transport callbacks */
-    xqc_engine_register_alpn(engine_, config_.alpn, strlen(config_.alpn), &raw_cbs);
+    for (const auto &alpn : config_.alpn) {
+        ret = xqc_engine_register_alpn(engine_, alpn.c_str(), alpn.size(), &raw_cbs);
+        if (ret != XQC_OK) {
+            return BC_R_UNEXPECTED;
+        }
+    }
 
     state_ = CONNTOR_STATE_WORKING;
 
@@ -2056,8 +2242,94 @@ int SMPConnector::on_conn_cert_verify(
     const size_t cert_len[], 
     size_t certs_len,
     void *conn_user_data) {
-    /* self-signed cert used in test cases, return >= 0 means success */
-    return 0;
+    SMPConnection *user_conn = (SMPConnection *)conn_user_data;
+    if (!user_conn || !user_conn->connector_ || certs_len == 0) {
+        return -1;
+    }
+    SMPConnector *connector = user_conn->connector_;
+
+    X509 *ca = user_conn->root_ca_
+             ? user_conn->root_ca_
+             : connector->root_ca_;
+    if (!ca) {
+        return 0;
+    }
+
+    X509_STORE *store = X509_STORE_new();
+    if (!store) {
+        return -1;
+    }
+    X509_STORE_add_cert(store, ca);
+
+    STACK_OF(X509) *chain = sk_X509_new_null();
+    X509 *leaf = nullptr;
+    for (size_t i = 0; i < certs_len; i++) {
+        const unsigned char *p = certs[i];
+        X509 *cert = d2i_X509(nullptr, &p, cert_len[i]);
+        if (!cert) continue;
+        if (i == 0) leaf = cert;
+        else sk_X509_push(chain, cert);
+    }
+
+    int result = -1;
+    if (leaf) {
+        X509_STORE_CTX *ctx = X509_STORE_CTX_new();
+        if (ctx && X509_STORE_CTX_init(ctx, store, leaf, chain) == 1) {
+            if (X509_verify_cert(ctx) == 1) {
+                const char *host = user_conn->config_.server_host;
+                if (!host || strlen(host) == 0) {
+                    host = user_conn->host_.length() > 0
+                         ? user_conn->host_.c_str()
+                         : connector->config_.server_host;
+                }
+                if (host && strlen(host) > 0
+                    && X509_check_host(leaf, host,
+                        strlen(host), 0, nullptr) == 1) {
+                    result = 0;
+                } else {
+                    std::string msg = std::string("certificate hostname mismatch, expected=")
+                                    + (host ? host : "(null)");
+                    user_conn->cert_verify_error_ = msg;
+                    LogQ(connector->logger_ctx_, _ERROR_,
+                        "cert verify: %s", msg.c_str());
+                }
+            } else {
+                int err = X509_STORE_CTX_get_error(ctx);
+                std::string msg = std::string("certificate chain validation failed: ")
+                                + X509_verify_cert_error_string(err);
+                user_conn->cert_verify_error_ = msg;
+                LogQ(connector->logger_ctx_, _ERROR_,
+                    "cert verify: %s", msg.c_str());
+            }
+        }
+        if (result != 0) {
+            char subj_buf[256] = {0};
+            char issuer_buf[256] = {0};
+            X509_NAME_oneline(X509_get_subject_name(leaf), subj_buf, sizeof(subj_buf));
+            X509_NAME_oneline(X509_get_issuer_name(leaf), issuer_buf, sizeof(issuer_buf));
+            LogQ(connector->logger_ctx_, _ERROR_,
+                "cert verify: server leaf cert subject=%s, issuer=%s", subj_buf, issuer_buf);
+            for (int i = 0; i < sk_X509_num(chain); i++) {
+                X509 *ic = sk_X509_value(chain, i);
+                char ic_subj[256] = {0};
+                char ic_issuer[256] = {0};
+                X509_NAME_oneline(X509_get_subject_name(ic), ic_subj, sizeof(ic_subj));
+                X509_NAME_oneline(X509_get_issuer_name(ic), ic_issuer, sizeof(ic_issuer));
+                LogQ(connector->logger_ctx_, _ERROR_,
+                    "cert verify: chain[%d] subject=%s, issuer=%s", i, ic_subj, ic_issuer);
+            }
+            char ca_subj[256] = {0};
+            X509_NAME_oneline(X509_get_subject_name(ca), ca_subj, sizeof(ca_subj));
+            LogQ(connector->logger_ctx_, _ERROR_,
+                "cert verify: local trusted CA subject=%s", ca_subj);
+        }
+        if (ctx) X509_STORE_CTX_free(ctx);
+        X509_free(leaf);
+    }
+
+    sk_X509_pop_free(chain, X509_free);
+    X509_STORE_free(store);
+    return result;
 }
 
 int SMPConnector::on_conn_closing_notify(
@@ -2066,7 +2338,14 @@ int SMPConnector::on_conn_closing_notify(
     xqc_int_t err_code,
     void *conn_user_data) {
     SMPConnection* user_conn = (SMPConnection*)conn_user_data;
-    //LogQ(user_conn->connector_->logger_ctx_, "conn closing: %d\n", err_code);
+    if (!user_conn) {
+        return XQC_OK;
+    }
+    if (!user_conn->cert_verify_error_.empty() && user_conn->connect_rpc_) {
+        std::string msg = user_conn->cert_verify_error_;
+        user_conn->_NotifyConnectResult(NULL, BC_R_FAILURE,
+            msg.c_str(), msg.size());
+    }
     return XQC_OK;
 }
 
@@ -2188,7 +2467,7 @@ SMPConnector::on_raw_stream_write_notify(xqc_stream_t *stream, void *user_data)
     SMPStream *user_stream = (SMPStream *) user_data;
     if (user_stream)
     {
-        //ret = user_stream->Send();
+        ret = user_stream->OnWriteNotify();
     }
     return ret;
 }
@@ -2357,7 +2636,7 @@ SMPConnector::conn_write_socket_cb(
     if (conn)
     {
         res = conn->WritePacket(buf, size, peer_addr, peer_addrlen);
-        if (res <= 0) {
+        if (res == XQC_SOCKET_ERROR) {
             LogQ(conn->connector_->logger_ctx_, _ERROR_, "write_socket: FAILED res:%d size:%zu", res, size);
         }
     }
@@ -2367,6 +2646,18 @@ SMPConnector::conn_write_socket_cb(
     }
 
     return res;
+}
+
+ssize_t
+SMPConnector::conn_write_socket_ex_cb(
+    uint64_t path_id,
+    const unsigned char *buf,
+    size_t size,
+    const struct sockaddr *peer_addr,
+    socklen_t peer_addrlen,
+    void *conn_user_data)
+{
+    return conn_write_socket_cb(buf, size, peer_addr, peer_addrlen, conn_user_data);
 }
 
 

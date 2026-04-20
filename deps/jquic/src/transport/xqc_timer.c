@@ -89,7 +89,7 @@ xqc_timer_loss_detection_timeout(xqc_timer_type_t type, xqc_usec_t now, void *us
 
     } else {
         if (xqc_conn_peer_complete_address_validation(conn)) {
-            xqc_log(conn->log, XQC_LOG_WARN, "|exception|peer validated address while inflight bytes is 0|");
+            xqc_log(conn->log, XQC_LOG_DEBUG, "|timer fired after inflight drained|peer validated address while inflight bytes is 0|");
             return;
         }
 

@@ -1241,6 +1241,11 @@ void SMPServer::OnRecvData(BCBuffer* pBuffer, BCSockAddrS& refSrcAddr)
     _CloseCheck();
 }
 
+void SMPServer::OnCheckAvailable()
+{
+    
+}
+
 void SMPServer::OnRestart(BCRESULT result)
 {
 

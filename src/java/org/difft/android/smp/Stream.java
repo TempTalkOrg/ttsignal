@@ -9,7 +9,7 @@ public class Stream {
     private Object userObject;
     private static Charset utf8 = Charset.forName("UTF-8");
 
-    public Stream(Connection connection, int streamId){
+    public Stream(Connection connection, int streamId) {
         this.connection = connection;
         this.streamId = streamId;
     }
@@ -22,39 +22,39 @@ public class Stream {
         return streamId;
     }
 
-    public int sendCmd(int transId, byte[] data){
-        if (isClosed()){
+    public int sendCmd(int transId, byte[] data) {
+        if (isClosed()) {
             return -1;
         }
         return connection.sendPacket(Const.PTYPE_CMD, (new Date()).getTime(), transId, streamId, data);
     }
 
-    public int sendData(byte[] data){
-        if (isClosed()){
+    public int sendData(byte[] data) {
+        if (isClosed()) {
             return -1;
         }
         return connection.sendPacket(Const.PTYPE_DATA, (new Date()).getTime(), 0, streamId, data);
     }
 
-    public int sendText(String text){
-        if (isClosed()){
+    public int sendText(String text) {
+        if (isClosed()) {
             return -1;
         }
         return connection.sendPacket(Const.PTYPE_DATA, (new Date()).getTime(), 0, streamId, text.getBytes(utf8));
     }
 
-    public Object setUserObject(Object obj){
+    public Object setUserObject(Object obj) {
         Object old = userObject;
         userObject = obj;
         return old;
     }
 
-    public Object getUserObject(){
+    public Object getUserObject() {
         return userObject;
     }
 
-    public void close(){
-        if (isClosed()){
+    public void close() {
+        if (isClosed()) {
             return;
         }
         connection.closeStream(this.streamId);

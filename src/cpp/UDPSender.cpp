@@ -7,6 +7,11 @@
 #include "UDPSender.h"
 #include <BC/BCLog.h>
 #include "Utils.h"
+#ifdef OS_ANDROID
+#include <android/api-level.h>
+#include <dlfcn.h>
+#include <cerrno>
+#endif
 
 
 
@@ -17,8 +22,9 @@
 
 #define SNDR_STATE_FREED		0
 #define SNDR_STATE_INACTIVE		1
-#define SNDR_STATE_READY		2
-#define SNDR_STATE_READING		3
+#define SNDR_STATE_RESTARTING	2
+#define SNDR_STATE_READY		3
+#define SNDR_STATE_READING		4
 #define SNDR_STATE_MAX			9
 
 
@@ -66,7 +72,11 @@ UDPSender::UDPSender()
 	, m_pHandler(NULL)
 	, m_bBindIP(false)
 	, m_bBindPort(false)
-	, m_bRestart(false)
+	, m_nPendingRestart(0)
+	, m_bCheckAvailable(false)
+	, m_nCheckAvailableTimerId(0)
+	, m_nRecvDataCount(0)
+	, m_nNetworkHandle(0)
 {
 	memset(&m_sSelfAddr, 0, sizeof(BCSockAddrS));
 	memset(&m_sSockAddr, 0, sizeof(BCSockAddrS));
@@ -140,9 +150,9 @@ out:
 	return result;
 }
 
-BCRESULT UDPSender::Restart()
+BCRESULT UDPSender::Restart(bool checkAvailable, int64_t networkHandle)
 { 
-	PostEvent(MAKEEVENT(SNDRM_RESTART_WORK, 0, 0));
+	PostEvent(MAKEEVENT(SNDRM_RESTART_WORK, 0, 0), checkAvailable?1:0, (uint64_t)networkHandle);
 	return BC_R_SUCCESS;
 }
 
@@ -288,9 +298,30 @@ BCRESULT UDPSender::_InitSocket()
 		goto delete_socket;
 	}
 	m_pSocket->GetSockName(&m_sSelfAddr);
+#ifdef OS_ANDROID
+	if (m_nNetworkHandle != 0 && android_get_device_api_level() >= 23)
+	{
+		typedef int (*pfn_android_setsocknetwork)(uint64_t, int);
+		static pfn_android_setsocknetwork fn = (pfn_android_setsocknetwork)
+			dlsym(RTLD_DEFAULT, "android_setsocknetwork");
+		if (fn)
+		{
+			int ret = fn((uint64_t)m_nNetworkHandle, m_pSocket->GetFd());
+			LogQ(m_pLoggerCtx, _DEBUG_,
+				"UDP Sender: android_setsocknetwork(handle=%lld, fd=%d) = %d, errno=%d",
+				(long long)m_nNetworkHandle, m_pSocket->GetFd(), ret, ret == 0 ? 0 : errno);
+		}
+		else
+		{
+			LogQ(m_pLoggerCtx, _WARN_,
+				"UDP Sender: android_setsocknetwork not found via dlsym");
+		}
+	}
+#endif
 	char local_addr_str_[128];
 	bc_sockaddr_format(&m_sSelfAddr, local_addr_str_, sizeof(local_addr_str_));
-	LogQ(m_pLoggerCtx, _INFO_, "UDP Sender: started at %s", local_addr_str_);
+	LogQ(m_pLoggerCtx, _INFO_, "UDP Sender: started at %s (networkHandle=%lld)",
+		local_addr_str_, (long long)m_nNetworkHandle);
 
 	return BC_R_SUCCESS;
 
@@ -344,7 +375,7 @@ BOOL UDPSender::_ExitCheck()
 
 	if (m_eState == SNDR_STATE_READY)
 	{
-		ASSERT(m_nNewState <= SNDR_STATE_INACTIVE);
+		ASSERT(m_nNewState <= SNDR_STATE_READY);
 
 		if (!(m_nPendingRecv == 0 && m_nPendingSend == 0))
 		{
@@ -365,23 +396,22 @@ BOOL UDPSender::_ExitCheck()
 			/* Still waiting for control event to be delivered */
 			return (TRUE);
 		}
-
 		m_eState = SNDR_STATE_INACTIVE;
 
-		if (m_eState == m_nNewState && m_bRestart)
+		if (m_eState == m_nNewState)
 		{
-			m_bRestart = false;
-			// Continue work
-			BCRESULT result = _InitSocket();
-			if (result == BC_R_SUCCESS)
+			if (m_nPendingRestart > 0)
 			{
+				if (m_nCheckAvailableTimerId > 0)
+				{
+					UnscheduleTask(m_nCheckAvailableTimerId);
+					m_nCheckAvailableTimerId = 0;
+				}
+				_Restart();
 				m_eState = SNDR_STATE_READING;
 				_set_state(this, SNDR_STATE_MAX, BC_R_SUCCESS);
 			}
-			if (this->m_pHandler)
-			{
-				this->m_pHandler->OnRestart(result);
-			}
+			return FALSE;
 		}
 	}
 
@@ -396,7 +426,11 @@ BOOL UDPSender::_ExitCheck()
 		* set up.  Thus, we have no outstanding shutdown
 		* event at this point.
 		*/
-		ASSERT(m_eState == SNDR_STATE_INACTIVE);
+		if (m_nCheckAvailableTimerId > 0)
+		{
+			UnscheduleTask(m_nCheckAvailableTimerId);
+			m_nCheckAvailableTimerId = 0;
+		}
 
 		/*
 		* Detaching the task must be done after unlinking from
@@ -407,6 +441,61 @@ BOOL UDPSender::_ExitCheck()
 	}
 
 	return TRUE;
+}
+
+void UDPSender::_Restart()
+{
+	BCRESULT result = _InitSocket();
+	if (result == BC_R_SUCCESS)
+	{
+		if (m_bCheckAvailable)
+		{
+			m_nRecvDataCount = 0;
+			m_pHandler->OnCheckAvailable();
+			_UDP_RecvChunk();
+			result = ScheduleTask(m_nCheckAvailableTimerId, [this](int32_t timer_id) {
+				BCSpinMutex::Owner lock(m_sLock);
+				if (_ExitCheck())
+				{
+					return;
+				}
+				UnscheduleTask(m_nCheckAvailableTimerId);
+				if (m_nRecvDataCount > 0)
+				{
+					m_nRecvDataCount = 0;
+					m_nPendingRestart--;
+					m_bCheckAvailable = false;
+					m_pHandler->OnRestart(BC_R_SUCCESS);
+				}
+				else 
+				{
+					LogQ(m_pLoggerCtx, _INFO_, "UDP Sender: check available timeout");
+					m_nPendingRestart--;
+					m_bCheckAvailable = false;
+					_set_state(this, SNDR_STATE_INACTIVE, BC_R_NETUNREACH);
+				}
+				_ExitCheck();
+			}, m_sConfig.checkAvailableInterval, false);
+			if (result != BC_R_SUCCESS)
+			{
+				m_nPendingRestart--;
+				m_bCheckAvailable = false;
+				m_pHandler->OnRestart(result);
+			}
+		}
+		else
+		{
+			m_nPendingRestart--;
+			m_bCheckAvailable = false;
+			m_pHandler->OnRestart(BC_R_SUCCESS);
+		}
+	}
+	else
+	{
+		m_nPendingRestart--;
+		m_bCheckAvailable = false;
+		m_pHandler->OnRestart(result);
+	}
 }
 
 void UDPSender::_UDP_RecvChunk()
@@ -426,14 +515,6 @@ void UDPSender::_UDP_RecvChunk()
 		m_nPendingRecv++;
 		m_bAlterBuffer = !m_bAlterBuffer;
 		result = BC_R_SUCCESS;
-	}
-	else
-	{
-		ASSERT(0);
-		// Do some recycle for exit process
-
-		// Set exit signal
-		_set_state(this, SNDR_STATE_FREED, result);
 	}
 	(void)_ExitCheck();
 }
@@ -591,13 +672,18 @@ void UDPSender::_RecvDoneCallback(BCTask *pTask, BCTaskEvent *pEvent)
 	ASSERT (_this->m_nPendingRecv == 1);
 	_this->m_nPendingRecv--;
 
-	if (pSockEv->result != BC_R_SUCCESS && !_this->m_bRestart)
+	if (pSockEv->result != BC_R_SUCCESS && _this->m_nPendingRestart == 0)
 	{
-		//Do some recycle work for exit process
-
-
-		//Set free signal
-		_set_state(_this, SNDR_STATE_FREED, pSockEv->result);
+		switch (pSockEv->result)
+		{
+			case BC_R_NETUNREACH:
+			case BC_R_CANCELED:
+				break;
+			default:
+				//Set free signal
+				_set_state(_this, SNDR_STATE_FREED, pSockEv->result);
+				break;
+		}
 	}
 
 	if (_this->_ExitCheck())
@@ -647,16 +733,17 @@ void UDPSender::_SendDoneCallback(BCTask *pTask, BCTaskEvent *pEvent)
 		_this->m_nPendingSend--;
 	}
 
-	if (pSockEv->result != BC_R_SUCCESS && !_this->m_bRestart)
+	if (pSockEv->result != BC_R_SUCCESS && _this->m_nPendingRestart == 0)
 	{
 		switch (pSockEv->result)
 		{
-		case BC_R_CANCELED:
-			break;
-		default:
-			//Set free signal
-			_set_state(_this, SNDR_STATE_FREED, pSockEv->result);
-			break;
+			case BC_R_NETUNREACH:
+			case BC_R_CANCELED:
+				break;
+			default:
+				//Set free signal
+				_set_state(_this, SNDR_STATE_FREED, pSockEv->result);
+				break;
 		}
 	}
 
@@ -717,8 +804,18 @@ bool UDPSender::OnEventProcess(BCEventItemS &refEvent)
 		case SNDRM_CLIENT_SHUTDOWN:
 			break;
 		case SNDRM_RESTART_WORK:
-			_set_state(this, SNDR_STATE_INACTIVE, BC_R_SUCCESS);
-			m_bRestart = true;
+			if (m_nPendingRestart == 0)
+			{
+				_set_state(this, SNDR_STATE_INACTIVE, BC_R_SUCCESS);
+				m_nPendingRestart++;
+			}
+			else
+			{
+				m_nPendingRestart++;
+			}
+			m_bCheckAvailable = !!refEvent.wParam;
+			m_nNetworkHandle = (int64_t)refEvent.lParam;
+			m_nRecvDataCount = 0;
 			break;
 		default:
 			BCDefEventProc(refEvent);
@@ -761,6 +858,7 @@ void UDPSender::_OnConnectDone(BCRESULT result)
 void UDPSender::_OnDataRecv(BCBuffer *pBuffer, BCSockAddrS &refSrcAddr)
 {
 	ASSERT(pBuffer != NULL);
+	m_nRecvDataCount += pBuffer->RemainingLength();
 	if (m_pHandler)
 	{
 		m_sLock.Unlock();

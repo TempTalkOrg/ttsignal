@@ -483,6 +483,26 @@ void *BCBuffer::ReadBlock(uint32_t nSizeToRead, uint32_t &refReadSize)
 	return pRetval;
 }
 
+void *BCBuffer::PeekBlock(uint32_t nSizeToRead, uint32_t &refReadSize)
+{
+	uint32_t nOffset, nDataLen, nCurrBufIndex;
+	void *pRetval = NULL;
+
+	nOffset = m_nCurrent % G_nBlockSize;
+	nDataLen = BCMIN(G_nBlockSize - nOffset, m_nUsed - m_nCurrent);
+	if (nDataLen > 0)
+	{
+		nCurrBufIndex = m_nCurrent / G_nBlockSize;
+		refReadSize = BCMIN(nSizeToRead, nDataLen);
+		pRetval = (uint8_t *)m_lstData[nCurrBufIndex]->m_data + nOffset;
+	}
+	else
+	{
+		refReadSize = 0;
+	}
+	return pRetval;
+}
+
 void *BCBuffer::GetWritableBlock(uint32_t &refBlockSize)
 {
 	uint32_t nBlockSize;

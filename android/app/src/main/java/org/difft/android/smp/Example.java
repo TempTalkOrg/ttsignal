@@ -49,6 +49,18 @@ public class Example {
             }
 
             @Override
+            public void onStreamDataAcked(Connection conn, Stream stream, long ackDelayTime, int ackedBytes, int inflightBytes) {
+                // 流包确认时的处理逻辑
+                // System.out.println("流包确认: " + ackDelayTime + ", " + ackedBytes + ", " + inflightBytes);
+            }
+
+            @Override
+            public void onStreamDataSent(Connection conn, Stream stream, int transId, int size) {
+                // 流数据发送时的处理逻辑
+                System.out.println("流数据发送: " + transId + ", " + size);
+            }
+
+            @Override
             public void onRecvCmd(Connection conn, long timestamp, int transId, Stream stream, byte[] buffer) {
                 // 收到命令时的处理逻辑
                 System.out.println("收到命令: " + timestamp + ", " + transId);

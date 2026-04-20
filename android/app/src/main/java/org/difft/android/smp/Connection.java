@@ -18,7 +18,7 @@ public class Connection {
     private native int connect(long handle, String host, String props, int timeoutInMs);
     private native int sendPacket(long handle, long packet);
     private native void closeStream(long handle, int streamId);
-    private native void restart(long handle);
+    private native void restart(long handle, long networkHandle);
     private native void close(long handle);
     private native void destroy(long handle);
     
@@ -33,6 +33,8 @@ public class Connection {
         public void onConnectResult(Connection conn, int error, String message);
         public void onStreamCreated(Connection conn, int streamId);
         public void onStreamClosed(Connection conn, int streamId);
+        public void onStreamDataAcked(Connection conn, int streamId, long ackDelayTime, int ackedBytes, int inflightBytes);
+        public void onStreamDataSent(Connection conn, int streamId, int transId, int size);
         public void onRecvCmd(Connection conn, long timestamp, int transId, int streamId, byte[] data);
         public void onRecvData(Connection conn, long timestamp, int transId, int streamId, byte[] data);
         public void onRestart(Connection conn, int result, String address);
@@ -62,10 +64,27 @@ public class Connection {
             @Override
             public void onStreamClosed(Connection conn, int streamId) {
                 // 流关闭时的处理逻辑
-                System.out.println("Raw QUIC 流关闭, stream id : " + streamId);
                 Stream stream = streams.remove(streamId);
                 if (stream != null) {
                     handler.onStreamClosed(conn, stream);
+                }
+            }
+
+            @Override
+            public void onStreamDataAcked(Connection conn, int streamId, long ackDelayTime, int ackedBytes, int inflightBytes) {
+                // 流包确认时的处理逻辑
+                Stream stream = streams.get(streamId);
+                if (stream != null) {
+                    handler.onStreamDataAcked(conn, stream, ackDelayTime, ackedBytes, inflightBytes);
+                }
+            }
+
+            @Override
+            public void onStreamDataSent(Connection conn, int streamId, int transId, int size) {
+                // 流数据发送时的处理逻辑
+                Stream stream = streams.get(streamId);
+                if (stream != null) {
+                    handler.onStreamDataSent(conn, stream, transId, size);
                 }
             }
 
@@ -166,11 +185,15 @@ public class Connection {
         return userObject;
     }
 
-    public void restart(int streamId){
+    public void restart(long networkHandle){
         if (isClosed()){
             return;
         }
-        restart(this.connectionHandle);
+        restart(this.connectionHandle, networkHandle);
+    }
+
+    public void restart(){
+        restart(0);
     }
 
     public void close(){

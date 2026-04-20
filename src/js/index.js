@@ -160,7 +160,7 @@ ttsignal.Connector.prototype.close = function(){
  * 
  * 
  **/
-ttsignal.Connection.prototype._internalCallback = function(type, __arg2, __arg3){
+ttsignal.Connection.prototype._internalCallback = function(type, __arg2, __arg3, __arg4, __arg5){
     let self = this;
     switch(type){
         case 'handshakeFinished':
@@ -183,6 +183,20 @@ ttsignal.Connection.prototype._internalCallback = function(type, __arg2, __arg3)
             delete this.streams[__arg2];
             stream.onClose();
             break;
+        case 'streamDataAcked':
+            if (!this.streams.hasOwnProperty(__arg2)) {
+                break;
+            }
+            var stream = this.streams[__arg2];
+            stream.onDataAcked(__arg3, __arg4, __arg5);
+            break;
+        case 'streamDataSent':
+            if (!this.streams.hasOwnProperty(__arg2)) {
+                break;
+            }
+            var stream = this.streams[__arg2];
+            stream.onDataSent(__arg3, __arg4);
+            break;
         case 'command':
             if (!this.streams.hasOwnProperty(__arg2)) {
                 break;
@@ -195,7 +209,7 @@ ttsignal.Connection.prototype._internalCallback = function(type, __arg2, __arg3)
                 break;
             }
             var stream = this.streams[__arg2];
-            stream.onData(__arg3);
+            stream.onData(__arg3, __arg4);
             break;
         case 'restart':
             this.emit('restart', __arg2, __arg3);
@@ -331,21 +345,25 @@ class Stream extends EventEmitter {
         this.streamId = streamId;
         this.nextTransId = 2;
         this.stubs = {};
+        this.dataStreams = {};
     }
     onCommand(cmdStr){ 
         let self = this;
         try {
-            cmd = JSON.parse(cmdStr)
+            let cmd = JSON.parse(cmdStr)
             if (typeof(cmd) != 'object') {
                 throw Error('Invalid command value.' + __arg2);
             }
             if (!cmd.hasOwnProperty('name')){
                 throw Error('Invalid command value, MUST have "name" property.' + __arg2);
             }
-            if (cmd.name == '_error' || cmd.name == '_result'){
+            if (cmd.name == '_error' || cmd.name == '_result' || cmd.name == 'onStatus'){
                 if (self.stubs.hasOwnProperty(cmd.transId)) {
                     self.stubs[cmd.transId](cmd);
-                    delete self.stubs[cmd.transId];
+                    let keepStub = cmd.name == 'onStatus'
+                    if (!keepStub) {
+                        delete self.stubs[cmd.transId];
+                    }
                 }
             } else {
                 if (cmd.hasOwnProperty('transId')) {
@@ -374,12 +392,36 @@ class Stream extends EventEmitter {
             return;
         }
     }
-    onData(data){ 
+    onData(data, transId){ 
+        if (transId && this.dataStreams.hasOwnProperty(transId)) {
+            let ds = this.dataStreams[transId];
+            if (data.length === 0) {
+                delete this.dataStreams[transId];
+                ds.emit('end');
+            } else {
+                ds.emit('data', data);
+            }
+            return;
+        }
         this.emit('data', data);
     }
 
     onClose(){ 
+        for (let tid in this.dataStreams) {
+            this.dataStreams[tid].emit('end');
+        }
+        this.dataStreams = {};
         this.emit('close');
+    }
+
+    /** QUIC 发送侧：数据确认回调；emit `dataAcked`(ackDelayTimeµs, ackedBytes, inflightBytes)。 */
+    onDataAcked(ackDelayTime, ackedBytes, inflightBytes){
+        this.emit('dataAcked', ackDelayTime, ackedBytes, inflightBytes);
+    }
+
+    /** QUIC 发送侧：数据已从待发队列写入传输；emit `dataSent`(nTransId, size)。putFile 返回的 ws 仅转发本 transId 为 `dataSent`(size)。 */
+    onDataSent(nTransId, size){
+        this.emit('dataSent', nTransId, size);
     }
 
     /**
@@ -406,7 +448,7 @@ class Stream extends EventEmitter {
         let msg = JSON.stringify(cmd);
         let buf = Buffer.from(msg, 'utf8');
         this.conn.__sendPacket__(CONST.TTS_TYPE_COMMAND, (new Date).getTime(), 
-            0, this.streamId, buf);
+            cmd.transId, this.streamId, buf);
     }
 
     /**
@@ -425,6 +467,162 @@ class Stream extends EventEmitter {
         }
         this.conn.__sendPacket__(CONST.TTS_TYPE_MESSAGE, (new Date).getTime(), 
             0, this.streamId, data);
+    }
+
+    /**
+     * 请求文件（数据流下载）。
+     *
+     * @method getFile
+     * @public
+     * @param req {Object} 请求参数，如 {path:"index.html"}
+     * @param callback {Function} 命令响应回调，透传给底层 __sendPacket__
+     * @return {EventEmitter} 数据流对象，支持 'data' 和 'end' 事件
+     * @example
+     *     let ds = stream.getFile({path:"index.html"}, (cmd)=>{
+     *         console.log('response:', cmd);
+     *     });
+     *     ds.on('data', (chunk) => { ... });
+     *     ds.on('end', () => { ... });
+     **/
+    getFile(args, callback){
+        if (typeof(args) != 'object') {
+            throw Error('Invalid request value.');
+        }
+        if (!args.hasOwnProperty('path')) {
+            throw Error('Invalid request value, MUST have "path" property.');
+        }
+        args.method = 'GET';
+        let req = {
+            name: 'staticFile',
+            props: args
+        };
+        let self = this;
+        let transId = this.nextTransId++;
+        req.transId = transId;
+        if (typeof callback === 'function') {
+            this.stubs[transId] = callback;
+        }
+        let ds = new EventEmitter();
+        ds.once('end', () => { delete self.dataStreams[transId]; });
+        this.dataStreams[transId] = ds;
+        let msg = JSON.stringify(req);
+        let buf = Buffer.from(msg, 'utf8');
+        this.conn.__sendPacket__(CONST.TTS_TYPE_COMMAND, (new Date).getTime(),
+            transId, this.streamId, buf);
+        return ds;
+    }
+
+    /**
+     * 上传文件（数据流上传）。
+     *
+     * @method putFile
+     * @public
+     * @param req {Object} 请求参数，如 {path:"upload.bin"}
+     * @param callback {Function} 命令响应回调
+     * @return {events.EventEmitter} 写入流：write(data)、end()，并可 on('dataSent', (size)=>{})（仅本 putFile 事务）。
+     * @example
+     *     let ws = stream.putFile({path:"upload.bin"}, (cmd)=>{
+     *         console.log('response:', cmd);
+     *     });
+     *     ws.on('dataSent', (size) => {});
+     *     ws.write(chunk1);
+     *     ws.write(chunk2);
+     *     ws.end();
+     **/
+    putFile(args, callback){
+        if (typeof(args) != 'object') {
+            throw Error('Invalid request value.');
+        }
+        if (!args.hasOwnProperty('path')) {
+            throw Error('Invalid request value, MUST have "path" property.');
+        }
+        if (!args.hasOwnProperty('size')) {
+            throw Error('Invalid request value, MUST have "path" property.');
+        }
+        args.method = 'PUT';
+        let req = {
+            name: 'staticFile',
+            props: args
+        };
+        let self = this;
+        let transId = this.nextTransId++;
+        req.transId = transId;
+        if (typeof callback === 'function') {
+            this.stubs[transId] = callback;
+        }
+        let msg = JSON.stringify(req);
+        let buf = Buffer.from(msg, 'utf8');
+        this.conn.__sendPacket__(CONST.TTS_TYPE_COMMAND, (new Date).getTime(),
+            transId, this.streamId, buf);
+        let ended = false;
+        let ws = new EventEmitter();
+        let onDataSent = (nTransId, size) => {
+            if (nTransId == transId) {
+                ws.emit('dataSent', size);
+            }
+        }
+        this.on('dataSent', onDataSent);
+        ws.write = (data) => {
+            if (ended) {
+                throw Error('Write after end.');
+            }
+            if (data instanceof Buffer == false) {
+                throw Error('Invalid data type, MUST be Buffer.');
+            }
+            self.conn.__sendPacket__(CONST.TTS_TYPE_MESSAGE, (new Date).getTime(),
+                transId, self.streamId, data);
+        }
+        ws.end = () => {
+            if (ended) return;
+            ended = true;
+            self.conn.__sendPacket__(CONST.TTS_TYPE_MESSAGE, (new Date).getTime(),
+                transId, self.streamId, Buffer.alloc(0));
+            self.removeListener('dataSent', onDataSent);
+        }
+        return ws;
+    }
+
+    /**
+     * 请求文件（数据流下载）。
+     *
+     * @method getLogFile
+     * @public
+     * @param req {Object} 请求参数，如 {path:"room_name"}
+     * @param callback {Function} 命令响应回调，透传给底层 __sendPacket__
+     * @return {EventEmitter} 数据流对象，支持 'data' 和 'end' 事件
+     * @example
+     *     let ds = stream.getLogFile({path:"room_name"}, (cmd)=>{
+     *         console.log('response:', cmd);
+     *     });
+     *     ds.on('data', (chunk) => { ... });
+     *     ds.on('end', () => { ... });
+     **/
+    getLogFile(args, callback){
+        if (typeof(args) != 'object') {
+            throw Error('Invalid request value.');
+        }
+        if (!args.hasOwnProperty('roomId')) {
+            throw Error('Invalid request value, MUST have "roomId" property.');
+        }
+        args.method = 'GET';
+        let req = {
+            name: 'logFile',
+            props: args
+        };
+        let self = this;
+        let transId = this.nextTransId++;
+        req.transId = transId;
+        if (typeof callback === 'function') {
+            this.stubs[transId] = callback;
+        }
+        let ds = new EventEmitter();
+        ds.once('end', () => { delete self.dataStreams[transId]; });
+        this.dataStreams[transId] = ds;
+        let msg = JSON.stringify(req);
+        let buf = Buffer.from(msg, 'utf8');
+        this.conn.__sendPacket__(CONST.TTS_TYPE_COMMAND, (new Date).getTime(),
+            transId, this.streamId, buf);
+        return ds;
     }
 
     /**
@@ -682,7 +880,7 @@ ttsignal.ServerConnection.prototype.sendCommand = function(cmd, callback){
     }
     let msg = JSON.stringify(cmd);
     let buf = Buffer.from(msg, 'utf8');
-    this.__sendPacket__(CONST.TTS_TYPE_COMMAND, (new Date).getTime(), 0, buf);
+    this.__sendPacket__(CONST.TTS_TYPE_COMMAND, (new Date).getTime(), cmd.transId, 0, buf);
 }
 
 /**
@@ -750,6 +948,9 @@ ttsignal.createConnector = function(config){
     }
     if (!config.alpn){
         throw Error('Invalid alpn value.');
+    }
+    if (config.caCertPem && !config.ca_cert_pem) {
+        config.ca_cert_pem = config.caCertPem;
     }
     return ttsignal.__createConnector__(config);
 }

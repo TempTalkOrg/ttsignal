@@ -1,0 +1,19 @@
+*.iml
+.gradle/
+.kotlin/
+/.idea/
+local.properties
+.DS_Store
+
+# Build outputs
+/build/
+app/build/
+/out/
+/captures/
+
+# NDK / CMake
+.externalNativeBuild/
+.cxx/
+
+# log files and data files
+data/

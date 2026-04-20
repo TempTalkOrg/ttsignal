@@ -27,6 +27,7 @@ class UDPSenderGroup
 
         void OnSendData(uint32_t nWrite, UDPSender* pSender) override;
         void OnRecvData(BCBuffer* pBuffer, BCSockAddrS& refSrcAddr) override;
+        void OnCheckAvailable() override;
         void OnRestart(BCRESULT result) override;
         void OnUdpClosed() override;
 
@@ -41,11 +42,9 @@ class UDPSenderGroup
     class Config
     {
     public:
-        Config() : num_of_senders(2) {}
+        Config() : num_of_senders(1) {}
 
-        ~Config()
-        {
-        }
+        ~Config() = default;
 
         uint32_t        num_of_senders;
 
@@ -69,7 +68,8 @@ public:
                     IUDPSenderHandler *pHandler,
                     bool bindIP = false,
                     bool bindPort = false);
-    BCRESULT    Restart();
+    BCRESULT    Restart(int64_t networkHandle = 0);
+    BCRESULT    Connect(BCSockAddrS& refSockAddr);
     BCRESULT    StartRecv();
     BCRESULT    Send(
                     BCSockAddrS& refSockAddr,
@@ -82,6 +82,7 @@ public:
 private:
     void        OnSenderSendData(UDPSender* sender, uint32_t nWrite);
     void        OnSenderRecvData(UDPSender* sender, BCBuffer* pBuffer, BCSockAddrS& refSrcAddr);
+    void        OnSenderCheckAvailable(UDPSender* sender);
     void        OnSenderRestart(UDPSender* sender, BCRESULT result);
     void        OnSenderUdpClosed(UDPSender* sender);
 

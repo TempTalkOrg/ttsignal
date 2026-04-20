@@ -115,8 +115,10 @@ private:
 	void				OnJsExecDone(RPCStub *pStub);
 	void 				OnJsStreamCreated(uint32_t nStreamId);
 	void 				OnJsStreamClosed(uint32_t nStreamId);
+	void				OnJsStreamDataAcked(uint32_t nStreamId, xqc_usec_t ack_delay_time, size_t acked_bytes, size_t inflight_bytes);
+	void				OnJsStreamDataSent(uint32_t nStreamId, uint32_t nTransId, size_t size);
 	void				OnJsRecvCmd(uint32_t nStreamId, LPCSTR cmd, size_t len);
-	void				OnJsRecvData(uint32_t nStreamId, LPCVOID data, size_t len);
+	void				OnJsRecvData(uint32_t nStreamId, uint32_t nTransId, LPCVOID data, size_t len);
 	void				OnJsRestart(BCRESULT result, const char *lpszAddr);
 	void				OnJsClosed(LPCSTR strReason);
 private:
@@ -129,6 +131,8 @@ private:
 	void				OnExecDone(IRPCStub *pStub) override;
 	void 				OnStreamCreated(uint32_t nStreamId) override;
 	void 				OnStreamClosed(uint32_t nStreamId) override;
+	void				OnStreamDataAcked(uint32_t nStreamId, xqc_usec_t ack_delay_time, size_t acked_bytes, size_t inflight_bytes) override;
+	void				OnStreamDataSent(uint32_t nStreamId, uint32_t nTransId, size_t size) override;
 	void				OnRecvCmd(const SMPHeader &refHeader, const char* lpszCmd, size_t msg_size) override;
 	void				OnRecvData(const SMPHeader &refHeader, LPCVOID data, size_t msg_size) override;
 	void				OnRestart(BCRESULT result, const char *lpszAddr) override;

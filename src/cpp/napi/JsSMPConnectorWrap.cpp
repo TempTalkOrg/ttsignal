@@ -24,11 +24,13 @@ enum
 	JCM_EXEC_DONE			= 2,
 	JCM_STREAM_CREATED		= 3,
 	JCM_STREAM_CLOSED		= 4,
-	JCM_RECV_CMD			= 5,
-	JCM_RECV_DATA			= 6,
-	JCM_RESTART				= 7,
-	JCM_CLOSE				= 8,
-	JCM_LOG_MSG				= 9,
+	JCM_STREAM_DATA_ACKED	= 5,
+	JCM_STREAM_DATA_SENT	= 6,
+	JCM_RECV_CMD			= 7,
+	JCM_RECV_DATA			= 8,
+	JCM_RESTART				= 9,
+	JCM_CLOSE				= 10,
+	JCM_LOG_MSG				= 11,
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -557,6 +559,41 @@ void JsSMPConnectionWrap::OnJsStreamClosed(uint32_t nStreamId)
 	}
 }
 
+void JsSMPConnectionWrap::OnJsStreamDataAcked(uint32_t nStreamId, xqc_usec_t ack_delay_time, size_t acked_bytes, size_t inflight_bytes)
+{
+	Napi::HandleScope scope(m_env);
+
+    if (m_hCallback.Value().IsFunction())
+	{
+		Napi::Function callback = m_hCallback.Value().As<Napi::Function>();
+		ArgsList argv = {
+			Napi::String::New(m_env, stream_data_acked_sym),
+			Napi::Number::New(m_env, nStreamId),
+			Napi::Number::New(m_env, ack_delay_time),
+			Napi::Number::New(m_env, acked_bytes),
+			Napi::Number::New(m_env, inflight_bytes)
+		};
+		TRY_CATCH_CALL(m_env, Value(), callback, argv);
+	}
+}
+
+void JsSMPConnectionWrap::OnJsStreamDataSent(uint32_t nStreamId, uint32_t nTransId, size_t size)
+{
+	Napi::HandleScope scope(m_env);
+
+    if (m_hCallback.Value().IsFunction())
+	{
+		Napi::Function callback = m_hCallback.Value().As<Napi::Function>();
+		ArgsList argv = {
+			Napi::String::New(m_env, stream_data_sent_sym),
+			Napi::Number::New(m_env, nStreamId),
+			Napi::Number::New(m_env, nTransId),
+			Napi::Number::New(m_env, size)
+		};
+		TRY_CATCH_CALL(m_env, Value(), callback, argv);
+	}
+}
+
 void JsSMPConnectionWrap::OnJsRecvCmd(uint32_t nStreamId, LPCSTR lpszCmd, size_t len)
 {
 	Napi::HandleScope scope(m_env);
@@ -573,18 +610,21 @@ void JsSMPConnectionWrap::OnJsRecvCmd(uint32_t nStreamId, LPCSTR lpszCmd, size_t
 	}
 }
 
-void JsSMPConnectionWrap::OnJsRecvData(uint32_t nStreamId, LPCVOID data, size_t len)
+void JsSMPConnectionWrap::OnJsRecvData(uint32_t nStreamId, uint32_t nTransId, LPCVOID data, size_t len)
 {
 	Napi::HandleScope scope(m_env);
 
     if (m_hCallback.Value().IsFunction())
     {
         Napi::Function callback = m_hCallback.Value().As<Napi::Function>();
-		Napi::Buffer<uint8_t> outBuffer = Napi::Buffer<uint8_t>::Copy(m_env, (uint8_t *)data, len);
+		Napi::Buffer<uint8_t> outBuffer = (data && len > 0)
+			? Napi::Buffer<uint8_t>::Copy(m_env, (uint8_t *)data, len)
+			: Napi::Buffer<uint8_t>::New(m_env, 0);
 		ArgsList argv = {
 			Napi::String::New(m_env, data_sym),
 			Napi::Number::New(m_env, nStreamId),
-			outBuffer
+			outBuffer,
+			Napi::Number::New(m_env, nTransId)
 		};
 		TRY_CATCH_CALL(m_env, Value(), callback, argv);
 	}
@@ -657,6 +697,12 @@ bool JsSMPConnectionWrap::OnExchangeEvent(BCEventItemS &refEvent)
 	case JCM_STREAM_CLOSED:
 		OnJsStreamClosed(refEvent.wParam);
 		break;
+	case JCM_STREAM_DATA_ACKED:
+		OnJsStreamDataAcked(refEvent.wParam, (xqc_usec_t)refEvent.lParam, (size_t)refEvent.vParams[0], (size_t)refEvent.vParams[1]);
+		break;
+	case JCM_STREAM_DATA_SENT:
+		OnJsStreamDataSent(refEvent.wParam, (uint32_t)refEvent.lParam, (size_t)refEvent.vParams[0]);
+		break;
 	case JCM_RECV_CMD:
 		if (refEvent.wParam)
 		{
@@ -665,10 +711,9 @@ bool JsSMPConnectionWrap::OnExchangeEvent(BCEventItemS &refEvent)
 		}
 		break;
 	case JCM_RECV_DATA:
-		if (refEvent.wParam)
 		{
-			LPCSTR lpszMsg = (LPCSTR)refEvent.wParam;
-			OnJsRecvData(refEvent.vParams[0], lpszMsg, refEvent.lParam);
+			LPCVOID lpData = (LPCVOID)refEvent.wParam;
+			OnJsRecvData(refEvent.vParams[0], refEvent.vParams[1], lpData, refEvent.lParam);
 		}
 		break;
 	case JCM_RESTART:
@@ -718,6 +763,25 @@ void JsSMPConnectionWrap::OnStreamClosed(uint32_t nStreamId)
 	JsExchanger::ExchangeEvent(sEvent, this);
 }
 
+void JsSMPConnectionWrap::OnStreamDataAcked(uint32_t nStreamId, xqc_usec_t ack_delay_time, size_t acked_bytes, size_t inflight_bytes)
+{
+	BCEventItemS sEvent(MAKEEVENT(JCM_STREAM_DATA_ACKED, 0, 0));
+	sEvent.wParam = (uint64_t)nStreamId;
+	sEvent.lParam = (uint64_t)ack_delay_time;
+	sEvent.vParams[0] = (uint64_t)acked_bytes;
+	sEvent.vParams[1] = (uint64_t)inflight_bytes;
+	JsExchanger::ExchangeEvent(sEvent, this);
+}
+
+void JsSMPConnectionWrap::OnStreamDataSent(uint32_t nStreamId, uint32_t nTransId, size_t size)
+{
+	BCEventItemS sEvent(MAKEEVENT(JCM_STREAM_DATA_SENT, 0, 0));
+	sEvent.wParam = (uint64_t)nStreamId;
+	sEvent.lParam = (uint64_t)nTransId;
+	sEvent.vParams[0] = (uint64_t)size;
+	JsExchanger::ExchangeEvent(sEvent, this);
+}
+
 void JsSMPConnectionWrap::OnRecvCmd(const SMPHeader &refHeader, LPCSTR lpszCmd, size_t msg_size)
 {
 	BCEventItemS sEvent(MAKEEVENT(JCM_RECV_CMD, 0, 0));
@@ -733,6 +797,7 @@ void JsSMPConnectionWrap::OnRecvData(const SMPHeader &refHeader, LPCVOID data, s
 	sEvent.wParam = (uint64_t)sEvent.CopyBuffer(data, msg_size);
 	sEvent.lParam = msg_size;
 	sEvent.vParams[0] = refHeader.m_nStreamId;
+	sEvent.vParams[1] = refHeader.m_nTransId;
 	JsExchanger::ExchangeEvent(sEvent, this);
 }
 

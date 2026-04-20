@@ -1662,6 +1662,20 @@ XQC_EXPORT_PUBLIC_API
 xqc_int_t jqc_conn_close(xqc_connection_t *conn, const xqc_cid_t *cid);
 
 /**
+ * @brief notify jquic that the local address has changed (e.g. after network switch).
+ * Updates conn/path local_addr and sends PATH_CHALLENGE to validate the new path.
+ * Requires write_socket_ex to be registered in transport callbacks.
+ *
+ * @param conn the QUIC connection
+ * @param local_addr new local address
+ * @param local_addrlen length of local_addr
+ * @return XQC_OK on success, error code on failure
+ */
+XQC_EXPORT_PUBLIC_API
+xqc_int_t jqc_conn_local_addr_changed(xqc_connection_t *conn,
+    const struct sockaddr *local_addr, socklen_t local_addrlen);
+
+/**
  * @brief close connection with error code
  */
 XQC_EXPORT_PUBLIC_API
