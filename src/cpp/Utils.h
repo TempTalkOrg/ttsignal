@@ -25,6 +25,12 @@ extern "C" {
 extern xqc_usec_t xqc_now(); // export from jquic
 }
 
+#define LOG_LEVEL_DEBUG    0x01
+#define LOG_LEVEL_INFO     0x02
+#define LOG_LEVEL_WARN     0x03
+#define LOG_LEVEL_ERROR    0x04
+#define LOG_LEVEL_FATAL    0x05
+
 
 inline bool operator==(const xqc_cid_t& cid1, const xqc_cid_t& cid2) {
     return (cid1.cid_len == cid2.cid_len && 0 == memcmp(cid1.cid_buf, cid2.cid_buf, cid1.cid_len));
@@ -153,6 +159,10 @@ Json::Value StatFixedAlloc(uint32_t nFilter);
 std::string StatFixedAllocToString(uint32_t nFilter);
 
 int32_t XQCLogLevelToBCLogLevel(int32_t level);
+
+int32_t BCLogLevelToLogLevel(int32_t level);
+
+int32_t LogLevelToBCLogLevel(int32_t level);
 
 void
 LogQ(const void *logger_ctx, int32_t nLevel, const char* szFmtStr, ...);

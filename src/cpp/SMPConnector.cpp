@@ -12,6 +12,7 @@
 #include <openssl/x509v3.h>
 #include <openssl/x509_vfy.h>
 #include <openssl/bio.h>
+#include <openssl/err.h>
 #include <HTTP/HTTPProtocol.h>
 #include "SMPConnector.h"
 #include "Runtime.h"
@@ -22,11 +23,105 @@
 #define XQC_PACKET_TMP_BUF_LEN 1500
 #define DEFAULT_CONNECT_TIMEOUT 10000
 
-#define LOG_LEVEL_DEBUG    0x01
-#define LOG_LEVEL_INFO     0x02
-#define LOG_LEVEL_WARN     0x03
-#define LOG_LEVEL_ERROR    0x04
-#define LOG_LEVEL_FATAL    0x05
+namespace {
+
+void freeCertVector(std::vector<X509*>& certs)
+{
+    for (X509* cert : certs) {
+        if (cert) {
+            X509_free(cert);
+        }
+    }
+    certs.clear();
+}
+
+bool isPemBundleEof(unsigned long err_code)
+{
+    if (err_code == 0) {
+        return true;
+    }
+    return ERR_GET_LIB(err_code) == ERR_LIB_PEM
+        && ERR_GET_REASON(err_code) == PEM_R_NO_START_LINE;
+}
+
+BCRESULT parsePemCertBundle(
+    const char* pem,
+    size_t pem_len,
+    std::vector<X509*>& certs,
+    LPVOID logger_ctx,
+    const char* source_tag)
+{
+    freeCertVector(certs);
+    if (!pem || pem_len == 0) {
+        return BC_R_SUCCESS;
+    }
+
+    BIO* bio = BIO_new_mem_buf(pem, (int)pem_len);
+    if (!bio) {
+        LogQ(logger_ctx, _ERROR_, "%s: failed to allocate BIO for ca_cert_pem", source_tag);
+        return BC_R_NOMEMORY;
+    }
+
+    while (true) {
+        X509* cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+        if (cert) {
+            certs.push_back(cert);
+            continue;
+        }
+
+        const unsigned long err_code = ERR_peek_last_error();
+        if (isPemBundleEof(err_code)) {
+            ERR_clear_error();
+            break;
+        }
+
+        char err_buf[256] = {0};
+        ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
+        LogQ(logger_ctx, _ERROR_, "%s: failed to parse ca_cert_pem bundle: %s",
+            source_tag, err_buf);
+        ERR_clear_error();
+        BIO_free(bio);
+        freeCertVector(certs);
+        return BC_R_INVALIDARG;
+    }
+
+    BIO_free(bio);
+    if (certs.empty()) {
+        LogQ(logger_ctx, _ERROR_, "%s: ca_cert_pem did not contain a valid certificate", source_tag);
+        return BC_R_INVALIDARG;
+    }
+
+    return BC_R_SUCCESS;
+}
+
+int addTrustedCAsToStore(X509_STORE* store, const std::vector<X509*>& certs, LPVOID logger_ctx)
+{
+    for (X509* cert : certs) {
+        if (!cert) {
+            continue;
+        }
+        if (X509_STORE_add_cert(store, cert) == 1) {
+            continue;
+        }
+
+        const unsigned long err_code = ERR_peek_last_error();
+#ifdef X509_R_CERT_ALREADY_IN_HASH_TABLE
+        if (ERR_GET_LIB(err_code) == ERR_LIB_X509
+            && ERR_GET_REASON(err_code) == X509_R_CERT_ALREADY_IN_HASH_TABLE) {
+            ERR_clear_error();
+            continue;
+        }
+#endif
+        char err_buf[256] = {0};
+        ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
+        LogQ(logger_ctx, _ERROR_, "cert verify: failed to add trusted CA to store: %s", err_buf);
+        ERR_clear_error();
+        return -1;
+    }
+    return 0;
+}
+
+} // namespace
 
 
 static inline xqc_usec_t time_now() { return bc_time_now(); }
@@ -643,11 +738,7 @@ SMPConnection::SMPConnection()
 
 SMPConnection::~SMPConnection()
 {
-    if (root_ca_)
-    {
-        X509_free(root_ca_);
-        root_ca_ = nullptr;
-    }
+    freeCertVector(root_cas_);
 }
 
 BCRESULT SMPConnection::Create(
@@ -667,8 +758,8 @@ BCRESULT SMPConnection::Create(
         return BC_R_INVALIDARG;
     }
     config_.Init(pConfig);
-    if (config_.alpn == NULL) {
-        LogQ(connector->logger_ctx_, _ERROR_, "invalid arguments: invalid alpn");
+    if (config_.alpn == NULL || config_.server_host == NULL) {
+        LogQ(connector->logger_ctx_, _ERROR_, "invalid arguments: invalid alpn or server_host");
         return BC_R_INVALIDARG;
     }
     pTaskMgr = Runtime::RandomTaskMgr();
@@ -679,17 +770,20 @@ BCRESULT SMPConnection::Create(
         return BC_R_NOMEMORY;
     }
     config_.Init(pConfig);
-    if (config_.ca_cert_pem && config_.ca_cert_pem_len > 0)
-    {
-        BIO *bio = BIO_new_mem_buf(config_.ca_cert_pem, (int)config_.ca_cert_pem_len);
-        if (bio)
-        {
-            root_ca_ = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-            BIO_free(bio);
-        }
-        if (!root_ca_)
-        {
-            LogQ(connector->logger_ctx_, _ERROR_, "SMPConnection: failed to parse per-connection ca_cert_pem");
+    if (config_.ca_cert_pem && config_.ca_cert_pem_len > 0) {
+        BCRESULT parse_result = parsePemCertBundle(
+            config_.ca_cert_pem,
+            config_.ca_cert_pem_len,
+            root_cas_,
+            connector->logger_ctx_,
+            "SMPConnection");
+        if (parse_result != BC_R_SUCCESS) {
+            LogQ(connector->logger_ctx_, _ERROR_,
+                "SMPConnection: failed to parse per-connection ca_cert_pem");
+        } else {
+            LogQ(connector->logger_ctx_, _INFO_,
+                "SMPConnection: loaded %zu cert(s) from per-connection ca_cert_pem",
+                root_cas_.size());
         }
     }
     result = udp_socket_->Create(connector->logger_ctx_, pTaskMgr, pTimerMgr, 
@@ -915,7 +1009,7 @@ BCRESULT SMPConnection::Connect_Internal()
 
     xqc_conn_ssl_config_t conn_ssl_config;
     memset(&conn_ssl_config, 0, sizeof(conn_ssl_config));
-    if (root_ca_ || connector_->root_ca_) {
+    if (!root_cas_.empty() || !connector_->root_cas_.empty()) {
         conn_ssl_config.cert_verify_flag = XQC_TLS_CERT_FLAG_NEED_VERIFY
                                          | XQC_TLS_CERT_FLAG_ALLOW_SELF_SIGNED;
     }
@@ -1858,6 +1952,11 @@ BCRESULT SMPConnector::Config::Init(BCFObject* pConfig)
         ca_cert_pem = pool_.Strdup(GET_BCF_STRING(pVar));
         ca_cert_pem_len = strlen(ca_cert_pem);
     }
+    pVar = pConfig->Get("disableAutoRestart");
+    if (IS_BCF_BOOL(pVar))
+    {
+        disableAutoRestart = GET_BCF_BOOL(pVar);
+    }
     return BC_R_SUCCESS;
 }
 
@@ -1885,12 +1984,63 @@ SMPConnector::SMPConnector()
 
 SMPConnector::~SMPConnector()
 {
-    if (root_ca_)
+#if defined(TT_HAS_PATH_MONITOR)
+    if (path_monitor_)
     {
-        X509_free(root_ca_);
-        root_ca_ = nullptr;
+        // tt_netmon_stop guarantees the callback won't fire again, so it's
+        // safe to call here even though the SMPConnector is half-destroyed.
+        tt_netmon_stop(path_monitor_);
+        path_monitor_ = nullptr;
+    }
+#endif
+    freeCertVector(root_cas_);
+}
+
+#if defined(TT_HAS_PATH_MONITOR)
+void SMPConnector::OnPathChange(void* userdata, int64_t newIfIndex,
+                                const char* pathDesc)
+{
+    SMPConnector* self = static_cast<SMPConnector*>(userdata);
+    if (!self || newIfIndex <= 0) return;
+
+    // The first callback after tt_netmon_start fires ~immediately and is
+    // really just the monitor reporting the current default route, not a
+    // real change. If the app raced with us and already created/connected
+    // a connection between Create() and this first callback, restarting
+    // it here would bounce its UDP socket mid-handshake for no reason.
+    // Swallow the first invocation and only treat subsequent ones as true
+    // migration events. exchange returns the prior value, so we restart
+    // iff `first_path_callback_seen_` was already true.
+    bool was_first = !self->first_path_callback_seen_.exchange(
+        true, std::memory_order_acq_rel);
+    if (was_first)
+    {
+        LogQ(self->logger_ctx_, _INFO_,
+             "[SMPConnector] initial path ifIndex=%lld desc=\"%s\" (no restart)",
+             (long long)newIfIndex, pathDesc ? pathDesc : "");
+        return;
+    }
+
+    // Snapshot connection list under the lock, then defer the actual
+    // SMPConnection::Restart calls onto the runtime thread so the monitor
+    // thread (NWPathMonitor queue / netlink reader / Windows worker) is
+    // never blocked on QUIC bookkeeping.
+    std::vector<SMPConnection*> snapshot;
+    {
+        BCSpinMutex::Owner lock(self->lock_);
+        snapshot.reserve(self->conns_map_.size());
+        for (auto& kv : self->conns_map_) snapshot.push_back(kv.second);
+    }
+    LogQ(self->logger_ctx_, _INFO_,
+         "[SMPConnector] path change ifIndex=%lld desc=\"%s\" -> %zu connections",
+         (long long)newIfIndex, pathDesc ? pathDesc : "", snapshot.size());
+
+    for (SMPConnection* conn : snapshot)
+    {
+        if (conn) conn->Restart(newIfIndex);
     }
 }
+#endif // TT_HAS_PATH_MONITOR
 
 BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
 {
@@ -1907,26 +2057,24 @@ BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
         LogQ(logger_ctx_, _ERROR_, "invalid arguments: invalid alpn");
         return BC_R_INVALIDARG;
     }
-    if (config_.ca_cert_pem && config_.ca_cert_pem_len > 0)
-    {
-        BIO *bio = BIO_new_mem_buf(config_.ca_cert_pem, (int)config_.ca_cert_pem_len);
-        if (!bio)
-        {
-            LogQ(logger_ctx_, _ERROR_, "failed to allocate BIO for ca_cert_pem");
-            return BC_R_NOMEMORY;
+    if (config_.ca_cert_pem && config_.ca_cert_pem_len > 0) {
+        BCRESULT parse_result = parsePemCertBundle(
+            config_.ca_cert_pem,
+            config_.ca_cert_pem_len,
+            root_cas_,
+            logger_ctx_,
+            "SMPConnector");
+        if (parse_result != BC_R_SUCCESS) {
+            return parse_result;
         }
-        root_ca_ = PEM_read_bio_X509(bio, NULL, NULL, NULL);
-        BIO_free(bio);
-        if (!root_ca_)
-        {
-            LogQ(logger_ctx_, _ERROR_, "failed to parse ca_cert_pem");
-            return BC_R_INVALIDARG;
-        }
+        LogQ(logger_ctx_, _INFO_, "SMPConnector: loaded %zu cert(s) from ca_cert_pem",
+            root_cas_.size());
     }
+    int32_t log_level = LogLevelToBCLogLevel(config_.log_level);
     if (config_.log_file) {
-        logger_ctx_ = AddFileLogAppender(config_.log_file, _FINEST_, true, true);
+        logger_ctx_ = AddFileLogAppender(config_.log_file, log_level, true, true);
     } else {
-        logger_ctx_ = AddExternalLogAppender(log_callback, this, _FINEST_, true);
+        logger_ctx_ = AddExternalLogAppender(log_callback, this, log_level, true);
     }
     conn_settings_ = xqc_conn_get_conn_settings_template(XQC_CONN_SETTINGS_LOW_DELAY);
     if (config_.ping_on)
@@ -2078,6 +2226,30 @@ BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
     }
 
     state_ = CONNTOR_STATE_WORKING;
+
+#if defined(TT_HAS_PATH_MONITOR)
+    // Auto-restart on OS-reported active interface changes. Off-switch lives
+    // in config_.disableAutoRestart so server deployments (livekit-ai et al.)
+    // can opt out. tt_netmon_start fires its first callback ~immediately
+    // with the current default-route ifIndex; OnPathChange swallows that
+    // first invocation (see first_path_callback_seen_ in the header) so
+    // even if the app calls CreateConnection + Connect before the initial
+    // callback lands, no spurious mid-handshake Restart goes out.
+    if (!config_.disableAutoRestart)
+    {
+        path_monitor_ = tt_netmon_start(&SMPConnector::OnPathChange, this);
+        if (!path_monitor_)
+        {
+            LogQ(logger_ctx_, _WARN_,
+                 "[SMPConnector] tt_netmon_start failed; auto-restart disabled");
+        }
+    }
+    else
+    {
+        LogQ(logger_ctx_, _INFO_,
+             "[SMPConnector] auto-restart disabled by config");
+    }
+#endif
 
     return BC_R_SUCCESS;
 }
@@ -2248,10 +2420,10 @@ int SMPConnector::on_conn_cert_verify(
     }
     SMPConnector *connector = user_conn->connector_;
 
-    X509 *ca = user_conn->root_ca_
-             ? user_conn->root_ca_
-             : connector->root_ca_;
-    if (!ca) {
+    const std::vector<X509*>* trusted_cas = !user_conn->root_cas_.empty()
+        ? &user_conn->root_cas_
+        : &connector->root_cas_;
+    if (trusted_cas->empty()) {
         return 0;
     }
 
@@ -2259,7 +2431,10 @@ int SMPConnector::on_conn_cert_verify(
     if (!store) {
         return -1;
     }
-    X509_STORE_add_cert(store, ca);
+    if (addTrustedCAsToStore(store, *trusted_cas, connector->logger_ctx_) != 0) {
+        X509_STORE_free(store);
+        return -1;
+    }
 
     STACK_OF(X509) *chain = sk_X509_new_null();
     X509 *leaf = nullptr;
@@ -2318,10 +2493,21 @@ int SMPConnector::on_conn_cert_verify(
                 LogQ(connector->logger_ctx_, _ERROR_,
                     "cert verify: chain[%d] subject=%s, issuer=%s", i, ic_subj, ic_issuer);
             }
-            char ca_subj[256] = {0};
-            X509_NAME_oneline(X509_get_subject_name(ca), ca_subj, sizeof(ca_subj));
             LogQ(connector->logger_ctx_, _ERROR_,
-                "cert verify: local trusted CA subject=%s", ca_subj);
+                "cert verify: local trusted CA count=%zu", trusted_cas->size());
+            for (size_t i = 0; i < trusted_cas->size(); ++i) {
+                X509* ca_cert = (*trusted_cas)[i];
+                if (!ca_cert) {
+                    continue;
+                }
+                char ca_subj[256] = {0};
+                char ca_issuer[256] = {0};
+                X509_NAME_oneline(X509_get_subject_name(ca_cert), ca_subj, sizeof(ca_subj));
+                X509_NAME_oneline(X509_get_issuer_name(ca_cert), ca_issuer, sizeof(ca_issuer));
+                LogQ(connector->logger_ctx_, _ERROR_,
+                    "cert verify: trusted_ca[%zu] subject=%s, issuer=%s",
+                    i, ca_subj, ca_issuer);
+            }
         }
         if (ctx) X509_STORE_CTX_free(ctx);
         X509_free(leaf);
@@ -2752,7 +2938,8 @@ void SMPConnector::log_callback(void *data, int level, LPCSTR lpszMsg)
     Runtime::PostTask([data, level, msg] {
         auto *ctx = (SMPConnector*)data;
         if (ctx && ctx->handler_) {
-            ctx->handler_->OnLog(level, msg.c_str());
+            int32_t log_level = BCLogLevelToLogLevel(level);
+            ctx->handler_->OnLog(log_level, msg.c_str());
         }
     });
 }

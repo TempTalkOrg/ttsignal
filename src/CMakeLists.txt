@@ -10,6 +10,14 @@ project(ttsignal)
 option(TARGET_PLATFORM_LINUX "Target platform is linux" OFF)
 option(BUILD_JNI "Build JNI library" OFF)
 option(BUILD_NODE_ADDON "Build Node.js addon" ON)
+option(BUILD_IOS_FRAMEWORK "Build iOS static lib + bridge for xcframework" OFF)
+
+if(BUILD_IOS_FRAMEWORK)
+    # iOS toolchain forces these but be defensive: don't try to build the
+    # node addon or JNI lib when targeting iOS.
+    set(BUILD_NODE_ADDON OFF CACHE BOOL "" FORCE)
+    set(BUILD_JNI        OFF CACHE BOOL "" FORCE)
+endif()
 
 if(TARGET_PLATFORM_LINUX)
     set(TARGET_OS_LINUX TRUE)
@@ -19,14 +27,70 @@ endif()
 
 set(BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# 把构建机绝对路径前缀替换成相对路径，避免 __FILE__ / __builtin_FILE() / DWARF
+# 把开发者用户名（/Users/<name>/...）和仓库位置编进发行产物。
+# 必须在 add_subdirectory(deps/...) 之前调用，directory-level COMPILE_OPTIONS
+# 才会被三个 deps 子项目继承。
+#
+# 兼容性：
+#   * -ffile-prefix-map 同时影响 __FILE__ 与 DWARF 路径，需要 GCC 8+ /
+#     Clang 10+。Apple Clang (Xcode 12+) 与 Android NDK r21+ clang 都支持。
+#   * 老的 GCC 7（例如部分 brew 跨编译工具链）只认 -fdebug-prefix-map，
+#     这种情况下我们退而求其次只清理 DWARF 中的路径，__FILE__ 的字符串
+#     仍可能残留——会打 WARNING 提示升级编译器。
+#   * MSVC cl.exe：使用 /d1trimfile（VS 2019 16.4+）裁掉 __FILE__ 中的仓库根
+#     前缀；同时给出反斜杠与正斜杠两种根路径，以匹配 Ninja/MSBuild 传入的源路径。
+#     不对 clang-cl 添加该选项（请改用 -ffile-prefix-map）。
+include(CheckCCompilerFlag)
+get_filename_component(_TT_REPO_ROOT "${BASE_DIR}/.." ABSOLUTE)
+if (NOT MSVC)
+    check_c_compiler_flag("-ffile-prefix-map=/x=." TT_HAS_FFILE_PREFIX_MAP)
+    if (TT_HAS_FFILE_PREFIX_MAP)
+        add_compile_options("-ffile-prefix-map=${_TT_REPO_ROOT}=.")
+    else()
+        check_c_compiler_flag("-fdebug-prefix-map=/x=." TT_HAS_FDEBUG_PREFIX_MAP)
+        if (TT_HAS_FDEBUG_PREFIX_MAP)
+            add_compile_options("-fdebug-prefix-map=${_TT_REPO_ROOT}=.")
+        endif()
+        message(WARNING
+            "Compiler ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION} "
+            "does not support -ffile-prefix-map; absolute paths from __FILE__ "
+            "may still leak into the produced binary. Consider upgrading the "
+            "cross compiler to GCC 8+ / Clang 10+.")
+    endif()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    file(TO_NATIVE_PATH "${_TT_REPO_ROOT}" _TT_MSVC_TRIM_BS)
+    string(REGEX REPLACE "\\\\+$" "" _TT_MSVC_TRIM_BS "${_TT_MSVC_TRIM_BS}")
+    string(APPEND _TT_MSVC_TRIM_BS "\\")
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:C>:/d1trimfile:${_TT_MSVC_TRIM_BS}>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/d1trimfile:${_TT_MSVC_TRIM_BS}>"
+    )
+
+    file(TO_CMAKE_PATH "${_TT_REPO_ROOT}" _TT_MSVC_TRIM_FS)
+    string(REGEX REPLACE "/+$" "" _TT_MSVC_TRIM_FS "${_TT_MSVC_TRIM_FS}")
+    string(APPEND _TT_MSVC_TRIM_FS "/")
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:C>:/d1trimfile:${_TT_MSVC_TRIM_FS}>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/d1trimfile:${_TT_MSVC_TRIM_FS}>"
+    )
+endif()
+
 add_custom_target(touch_utils ALL
     COMMAND ${CMAKE_COMMAND} -E touch "${BASE_DIR}/cpp/Utils.cpp"
     COMMENT "Touching Utils.cpp to update build timestamp"
 )
 
-add_subdirectory(${BASE_DIR}/../deps/env/src deps/env.dir)
-add_subdirectory(${BASE_DIR}/../deps/boringssl/src deps/boringssl.dir)
-add_subdirectory(${BASE_DIR}/../deps/jquic deps/jquic.dir)
+# When building the iOS framework we link against the pre-built static
+# archives produced by ios/scripts/build-deps.sh — re-running the upstream
+# CMake projects via add_subdirectory would (a) re-trigger the boringssl Go
+# fetch every time and (b) rebuild ~5 minutes of crypto code on every core
+# iteration. Always run build-deps.sh once before this CMake step.
+if (NOT BUILD_IOS_FRAMEWORK)
+    add_subdirectory(${BASE_DIR}/../deps/env/src deps/env.dir)
+    add_subdirectory(${BASE_DIR}/../deps/boringssl/src deps/boringssl.dir)
+    add_subdirectory(${BASE_DIR}/../deps/jquic deps/jquic.dir)
+endif()
 
 add_definitions(-D__STDC_LIMIT_MACROS -DHAVE_PTHREAD -DCR_USE_FALLBACKS_FOR_GCC_WITH_LIBCXX 
         -DNOMINMAX
@@ -158,6 +222,45 @@ if (BUILD_NODE_ADDON)
         ${NODE_ADDON_SRC_DIR}/*.cpp
     )
 
+    # ----------------------------------------------------------------------
+    # Cross-platform path-change monitor (INetworkPathMonitor):
+    #   * Apple (macOS NAPI) -> src/cpp/apple/AppleNetworkMonitor.mm
+    #   * Linux (non-Android) -> src/cpp/linux/LinuxNetlinkMonitor.cpp
+    #   * Windows -> src/cpp/win32/WinIpChangeMonitor.cpp
+    # All NAPI builds get TT_HAS_PATH_MONITOR so SMPConnector wires the
+    # monitor up at construction. Android JNI (BUILD_JNI below) deliberately
+    # does NOT define this and continues to drive Connection::Restart from
+    # the Java NetworkCallback path instead.
+    # ----------------------------------------------------------------------
+    set(TT_PATH_MONITOR_SOURCES "")
+    set(TT_PATH_MONITOR_LIBS    "")
+    if (APPLE)
+        add_subdirectory(${BASE_DIR}/cpp/apple ${CMAKE_BINARY_DIR}/apple-monitor.dir)
+        list(APPEND TT_PATH_MONITOR_SOURCES ${TT_APPLE_MONITOR_SOURCES})
+        list(APPEND TT_PATH_MONITOR_LIBS "-framework Foundation" "-framework Network")
+    elseif (WIN32)
+        add_subdirectory(${BASE_DIR}/cpp/win32 ${CMAKE_BINARY_DIR}/win32-monitor.dir)
+        list(APPEND TT_PATH_MONITOR_SOURCES ${TT_WIN32_MONITOR_SOURCES})
+        # iphlpapi.dll has NotifyIpInterfaceChange / GetBestInterfaceEx /
+        # GetIfEntry2; ws2_32 covers htonl / WSAGetLastError.
+        list(APPEND TT_PATH_MONITOR_LIBS iphlpapi ws2_32)
+    elseif (UNIX AND NOT ANDROID)
+        # Linux + any other POSIX-but-not-Android NAPI target. We still gate
+        # the source itself on __linux__ inside the .cpp.
+        add_subdirectory(${BASE_DIR}/cpp/linux ${CMAKE_BINARY_DIR}/linux-monitor.dir)
+        list(APPEND TT_PATH_MONITOR_SOURCES ${TT_LINUX_MONITOR_SOURCES})
+    endif()
+    if (TT_PATH_MONITOR_SOURCES)
+        list(APPEND NODE_ADDON_SRC_FILES ${TT_PATH_MONITOR_SOURCES})
+        add_definitions(-DTT_HAS_PATH_MONITOR=1)
+        if (APPLE)
+            # AppleNetworkMonitor.mm uses ObjC dispatch + Network.framework;
+            # ARC keeps reference counts sane without manual retain/release.
+            set_source_files_properties(${TT_APPLE_MONITOR_SOURCES}
+                PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        endif()
+    endif()
+
     if (WIN32)
         list(APPEND NODE_ADDON_SRC_FILES
             ${BASE_DIR}/cpp/win32/win_delay_load_hook.c
@@ -255,6 +358,9 @@ if (BUILD_NODE_ADDON)
         ${CMAKE_DL_LIBS}
         ${EXTRA_LINK_FLAGS}
     )
+    if (TT_PATH_MONITOR_LIBS)
+        target_link_libraries(${LIB_NAME} PRIVATE ${TT_PATH_MONITOR_LIBS})
+    endif()
     if(NOT WIN32)
         target_link_libraries(${LIB_NAME} PRIVATE pthread)
     endif()
@@ -263,10 +369,10 @@ if (BUILD_NODE_ADDON)
     endif()
 
     set_target_properties(${LIB_NAME} PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY_DEBUG ${BASE_DIR}/../node_modules/ttsignal/${CMAKE_BUILD_TYPE}
-        LIBRARY_OUTPUT_DIRECTORY_RELEASE ${BASE_DIR}/../node_modules/ttsignal/${CMAKE_BUILD_TYPE}
-        RUNTIME_OUTPUT_DIRECTORY_DEBUG ${BASE_DIR}/../node_modules/ttsignal/${CMAKE_BUILD_TYPE}
-        RUNTIME_OUTPUT_DIRECTORY_RELEASE ${BASE_DIR}/../node_modules/ttsignal/${CMAKE_BUILD_TYPE}
+        LIBRARY_OUTPUT_DIRECTORY_DEBUG ${BASE_DIR}/../node_modules/ttsignal/dist/build/${CMAKE_BUILD_TYPE}
+        LIBRARY_OUTPUT_DIRECTORY_RELEASE ${BASE_DIR}/../node_modules/ttsignal/dist/build/${CMAKE_BUILD_TYPE}
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG ${BASE_DIR}/../node_modules/ttsignal/dist/build/${CMAKE_BUILD_TYPE}
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE ${BASE_DIR}/../node_modules/ttsignal/dist/build/${CMAKE_BUILD_TYPE}
     )
 endif() # BUILD_NODE_ADDON
 
@@ -348,3 +454,96 @@ if (BUILD_JNI)
             ${JAVA_SRC_FILES}
             OUTPUT_DIR ${BASE_DIR}/../out/${CMAKE_SYSTEM_NAME}/${CMAKE_BUILD_TYPE})
 endif()
+
+if (BUILD_IOS_FRAMEWORK)
+    # Pull in the Apple monitor + iOS Swift bridge sources / public headers /
+    # module map (TT_APPLE_MONITOR_* + TT_IOS_BRIDGE_*).
+    add_subdirectory(${BASE_DIR}/cpp/apple ${CMAKE_BINARY_DIR}/apple.dir)
+
+    # Caller (build-core.sh) is expected to pass IOS_DEPS_DIR pointing at
+    # build/ios-deps/<sdk>-<arch>/lib, where build-deps.sh has dropped the
+    # pre-built libssl / libcrypto / libjquic / libenv archives. If not
+    # supplied, fall back to the conventional layout.
+    if (NOT IOS_DEPS_DIR)
+        # Reconstruct from CMAKE_OSX_SYSROOT + CMAKE_SYSTEM_PROCESSOR.
+        get_filename_component(_sdk_basename "${CMAKE_OSX_SYSROOT}" NAME)
+        # SDK path looks like .../iPhoneOS18.5.sdk — strip version + .sdk to get sdk name
+        string(REGEX REPLACE "([A-Za-z]+)[0-9.]*\\.sdk$" "\\1" _sdk_name "${_sdk_basename}")
+        string(TOLOWER "${_sdk_name}" _sdk_name_lc)
+        set(IOS_DEPS_DIR "${BASE_DIR}/../build/ios-deps/${_sdk_name_lc}-${CMAKE_SYSTEM_PROCESSOR}/lib")
+    endif()
+    if (NOT EXISTS "${IOS_DEPS_DIR}/libssl.a")
+        message(FATAL_ERROR
+            "BUILD_IOS_FRAMEWORK requires pre-built deps. Expected libssl.a "
+            "under ${IOS_DEPS_DIR}. Run ios/scripts/build-deps.sh first.")
+    endif()
+    message(STATUS "ttsignal_ios: deps from ${IOS_DEPS_DIR}")
+
+    file(GLOB TT_IOS_CORE_SRC
+        ${BASE_DIR}/cpp/*.cpp
+        ${BASE_DIR}/cpp/http-parser/http_parser.c
+    )
+
+    add_library(ttsignal_ios STATIC
+        ${TT_IOS_CORE_SRC}
+        ${TT_APPLE_MONITOR_SOURCES}
+        ${TT_IOS_BRIDGE_SOURCES}
+    )
+    add_dependencies(ttsignal_ios touch_utils)
+
+    # Tell SMPConnector to link against tt_netmon_* — same flag used by
+    # macOS / Linux / Windows NAPI builds so the runtime path is identical.
+    target_compile_definitions(ttsignal_ios PRIVATE TT_HAS_PATH_MONITOR=1)
+
+    target_include_directories(ttsignal_ios PUBLIC
+        ${BASE_DIR}/cpp
+        ${BASE_DIR}/cpp/apple
+        ${BASE_DIR}/../deps/env/src
+        ${BASE_DIR}/../deps/boringssl/src/include
+        ${BASE_DIR}/../deps/jquic/include
+    )
+
+    # ARC for the .mm bridge files. Plain .cpp/.c files get compiled the
+    # normal way (no ObjC runtime).
+    set_source_files_properties(
+        ${TT_APPLE_MONITOR_SOURCES}
+        ${TT_IOS_BRIDGE_SOURCES}
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+
+    # Link against pre-built static archives.
+    target_link_libraries(ttsignal_ios PRIVATE
+        ${IOS_DEPS_DIR}/libenv.a
+        ${IOS_DEPS_DIR}/libjquic.a
+        ${IOS_DEPS_DIR}/libssl.a
+        ${IOS_DEPS_DIR}/libcrypto.a
+    )
+
+    # Apple system frameworks needed by AppleNetworkMonitor / ios_logger.
+    target_link_libraries(ttsignal_ios PRIVATE
+        "-framework Foundation"
+        "-framework Network"
+    )
+
+    # Position-independent code & C++ standard floor for the iOS build.
+    set_target_properties(ttsignal_ios PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        OUTPUT_NAME "ttsignal_ios"
+        ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+    )
+
+    # Stage the public headers + module.modulemap next to the .a so the
+    # ios/scripts/build-xcframework.sh helper can pick them up without
+    # having to reach into src/cpp/apple/ across slices.
+    set(_TT_IOS_STAGE ${CMAKE_BINARY_DIR}/stage)
+    file(MAKE_DIRECTORY ${_TT_IOS_STAGE}/Headers ${_TT_IOS_STAGE}/Modules)
+    foreach(_h ${TT_APPLE_MONITOR_PUBLIC_HEADERS} ${TT_IOS_BRIDGE_PUBLIC_HEADERS})
+        get_filename_component(_hn ${_h} NAME)
+        configure_file(${_h} ${_TT_IOS_STAGE}/Headers/${_hn} COPYONLY)
+    endforeach()
+    configure_file(${TT_IOS_BRIDGE_MODULEMAP}
+                   ${_TT_IOS_STAGE}/Modules/module.modulemap COPYONLY)
+
+    message(STATUS "ttsignal: iOS framework bits staged at ${_TT_IOS_STAGE}")
+endif() # BUILD_IOS_FRAMEWORK

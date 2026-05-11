@@ -6,6 +6,24 @@ project(env)
 
 add_definitions( -D__STDC_LIMIT_MACROS)
 set(CMAKE_CXX_STANDARD 11)
+
+# 兜底：避免 __FILE__ / DWARF 把构建机绝对路径（含用户名）编进 .a / .so。
+# 当本项目被 add_subdirectory 时上层已经调用过 add_compile_options，重复添加
+# 同样的 prefix-map 是无害的（编译器按顺序应用，无副作用）。当 iOS 通过
+# build-deps.sh 直接 cmake 这个 CMakeLists 时，这里的注入是唯一的入口。
+include(CheckCCompilerFlag)
+get_filename_component(_TT_REPO_ROOT_ENV "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+if (NOT MSVC)
+    check_c_compiler_flag("-ffile-prefix-map=/x=." TT_ENV_HAS_FFILE_PREFIX_MAP)
+    if (TT_ENV_HAS_FFILE_PREFIX_MAP)
+        add_compile_options("-ffile-prefix-map=${_TT_REPO_ROOT_ENV}=.")
+    else()
+        check_c_compiler_flag("-fdebug-prefix-map=/x=." TT_ENV_HAS_FDEBUG_PREFIX_MAP)
+        if (TT_ENV_HAS_FDEBUG_PREFIX_MAP)
+            add_compile_options("-fdebug-prefix-map=${_TT_REPO_ROOT_ENV}=.")
+        endif()
+    endif()
+endif()
 #SET(CMAKE_BUILE_TYPE RELEASE)
 if (CMAKE_BUILD_TYPE MATCHES "Debug")
     if(NOT MSVC)

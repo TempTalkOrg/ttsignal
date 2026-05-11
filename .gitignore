@@ -53,3 +53,25 @@ build.ninja
 *.exp
 *.lib
 /.cursor/
+
+# iOS build outputs (everything except the per-slice ./build helper script)
+build/ios-deps/
+build/ios-xcframework/
+build/_test_*/
+build/ios-*-release/dist/
+build/ios-*-release/stage/
+build/ios-*-release/lib/
+build/ios-*-release/ios.dir/
+build/ios-*-debug/dist/
+build/ios-*-debug/stage/
+build/ios-*-debug/lib/
+build/ios-*-debug/ios.dir/
+build/ios-*-debug/apple.dir/
+# QUICTest local debug pipeline (libTTSignalDebug.a, headers, cmake scratch)
+build/quictest-debug/
+ios/build/
+build/release-repo-checkout/
+
+# Xcode user-specific state
+**/xcuserdata/
+**/*.xcuserstate

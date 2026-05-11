@@ -1,0 +1,17 @@
+# SwiftPM build artifacts when downstream consumers `swift build` against this repo
+.build/
+.swiftpm/
+Packages/
+*.xcodeproj/xcuserdata/
+xcuserdata/
+
+# CocoaPods cache used by `pod lib lint`
+Pods/
+
+# macOS noise
+.DS_Store
+
+# The xcframework is fetched from GitHub Releases at install time; never
+# commit it.
+TTSignal.xcframework/
+ttsignal-swift.zip

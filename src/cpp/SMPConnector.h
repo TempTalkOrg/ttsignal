@@ -14,6 +14,9 @@
 #include "SMPParser.h"
 #include "Utils.h"
 #include "SMPacket.h"
+#if defined(TT_HAS_PATH_MONITOR)
+#include "INetworkPathMonitor.h"
+#endif
 
 #include <xquic/xquic_typedef.h>
 #include <xquic/xquic.h>
@@ -329,7 +332,8 @@ private:
     ssize_t                 snd_sum         = 0;
     uint64_t                last_snd_ts     = 0;
     uint64_t                wrote_counter   = 0;
-    X509                *   root_ca_        = nullptr;
+    // Parsed trusted CA bundle loaded from per-connection ca_cert_pem (if provided).
+    std::vector<X509*>      root_cas_;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -357,6 +361,7 @@ class SMPConnector
             , linger_on(0), log_level('d'), alpn(NULL), ping_on(false)
             , ping_interval(0), log_file(NULL), active_connection_id_limit(0)
             , ca_cert_pem(NULL), ca_cert_pem_len(0)
+            , disableAutoRestart(false)
         {
             memset(&engine_ssl_config, 0, sizeof(engine_ssl_config));
         }
@@ -384,6 +389,11 @@ class SMPConnector
         uint64_t                    active_connection_id_limit;
         LPCSTR                      ca_cert_pem;
         size_t                      ca_cert_pem_len;
+        // Opt-out of the platform-native path-change monitor (NWPathMonitor /
+        // netlink / NotifyIpInterfaceChange). Default false on platforms that
+        // ship a monitor; ignored entirely on Android (Java NetworkCallback
+        // path is independent). Set true for long-lived server deployments.
+        bool                        disableAutoRestart;
 
         BCRESULT		Init(BCFObject* pConfig);
 
@@ -569,6 +579,13 @@ private:
                         void *conn_user_data);
 
     static void     log_callback(void *data, int level, LPCSTR lpszMsg);
+#if defined(TT_HAS_PATH_MONITOR)
+    // Path-change callback delivered by AppleNetworkMonitor / LinuxNetlinkMonitor
+    // / WinIpChangeMonitor. Runs on the monitor's own thread; we marshal onto
+    // the SMP runtime via Runtime::PostTask before touching conns_map_.
+    static void     OnPathChange(void* userdata, int64_t newIfIndex,
+                                 const char* pathDesc);
+#endif
 public:
     BCSpinMutex             lock_;
     Config                  config_;
@@ -594,8 +611,25 @@ public:
     // Stats
     std::atomic<size_t>		total_allocated_conns_;
     std::atomic<size_t>		total_freed_conns_;
-    // Self-signed root CA for cert verification
-    X509                    *   root_ca_ = nullptr;
+    // Parsed trusted CA bundle loaded from connector-level ca_cert_pem.
+    std::vector<X509*>      root_cas_;
+#if defined(TT_HAS_PATH_MONITOR)
+    // Owned by SMPConnector. Started in Create() if config_.disableAutoRestart
+    // is false; stopped in dtor. nullptr means "monitor disabled or unavailable",
+    // in which case the caller is responsible for invoking SMPConnection::Restart
+    // on roaming events itself.
+    TTNetworkMonitorRef         path_monitor_ = nullptr;
+    // tt_netmon_start fires its first callback ~immediately after Create()
+    // to report the *current* default-route ifIndex — that's not a real
+    // path change, just an initial notification. Restarting connections at
+    // that point would bounce a freshly-created (or in-flight handshake)
+    // SMPConnection's UDP socket for no benefit; we swallow the first
+    // OnPathChange invocation and only treat subsequent ones as actual
+    // migration events. atomic so the monitor thread (NWPathMonitor queue
+    // / netlink reader / Windows worker) and Runtime worker can both touch
+    // it safely.
+    std::atomic<bool>           first_path_callback_seen_{false};
+#endif
 };
 
 #endif // SMPCONNECTOR_H_INCLUDED__

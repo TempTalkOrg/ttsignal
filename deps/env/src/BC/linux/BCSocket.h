@@ -524,7 +524,7 @@ public:
 	BCRESULT				GetSockName(BCSockAddrS *addressp);
 	void					Cancel(BCTask *task, uint32_t how);
 	BCSocketTypeE		    GetType();
-#ifdef OS_ANDROID
+#if defined(OS_ANDROID) || defined(OS_APPLE) || defined(__linux__) || defined(_WIN32)
 	int						GetFd() const { return m_nFD; }
 #endif
 	BOOL					IsBound();

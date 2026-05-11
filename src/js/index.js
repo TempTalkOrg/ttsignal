@@ -1,19 +1,77 @@
+"use strict";
+
 /*******************************************************************************
  * javascript glue wrapper of ttsignal module
  * @module index.js
  * @author anto.
-*******************************************************************************/
+ ******************************************************************************/
 
-var util			= require('util');
-var EventEmitter    = require('events').EventEmitter;
+const EventEmitter = require("events").EventEmitter;
+const fs = require("fs");
+const path = require("path");
+const Module = require("module");
 
-var ttsignal             = null;
+const PLATFORM = process.platform;
+const ARCH = process.arch;
+const ADDON_BASENAME = `ttsignal.${PLATFORM}.${ARCH}.node`;
 
-if (process.ttsBuildType == 'debug') {
-    ttsignal = require('./Debug/ttsignal.'+process.platform+'.'+process.arch+'.node');
-} else {
-    ttsignal = require('./Release/ttsignal.'+process.platform+'.'+process.arch+'.node');
+function expandAsar(candidate) {
+  if (!candidate) return candidate;
+  const idx = candidate.indexOf(".asar/");
+  if (idx === -1) return candidate;
+  return candidate.replace(".asar/", ".asar.unpacked/");
 }
+
+function resolveAddonPath() {
+  const candidates = [];
+  if (process.env.TTSIGNAL_NATIVE_PATH) {
+    candidates.push(process.env.TTSIGNAL_NATIVE_PATH);
+  }
+
+  const baseDir = __dirname;
+  const kind = process.ttsBuildType === "debug" ? "Debug" : "Release";
+  const searchRoots = [
+    path.join(baseDir, "build", kind),
+    path.join(baseDir, "dist", "build", kind),
+    path.join(baseDir, "..", "build", kind),
+    path.join(baseDir, "..", "dist", "build", kind),
+  ];
+
+  for (const root of searchRoots) {
+    candidates.push(path.join(root, ADDON_BASENAME));
+  }
+
+  const unique = [...new Set(candidates.filter(Boolean))];
+
+  for (const candidate of unique) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+    const unpacked = expandAsar(candidate);
+    if (unpacked !== candidate && fs.existsSync(unpacked)) {
+      return unpacked;
+    }
+  }
+
+  const tried = unique.concat(unique.map(expandAsar)).filter(Boolean);
+  throw new Error(
+    `Unable to locate ttsignal native addon (${PLATFORM}/${ARCH}). Tried: ${tried.join(
+      ", "
+    )}`
+  );
+}
+
+function loadNativeAddon() {
+  const createRequire =
+    Module.createRequire ||
+    Module.createRequireFromPath ||
+    require("module").createRequire;
+  const req = createRequire(__filename);
+  const addonPath = resolveAddonPath();
+  return req(addonPath);
+}
+
+const ttsignal = loadNativeAddon();
 
 const CONST = {
     TTS_TYPE_COMMAND			: 0x01,
@@ -939,8 +997,23 @@ ttsignal.ServerConnection.prototype.close = function(){
  * @method createConnector
  * @public
  * @param config {Object} configure info.
+ * @param config.alpn {String} required, ALPN string ('ttsignal' on the wire regardless).
+ * @param config.ca_cert_pem {String=} optional, custom root CA in PEM format.
+ * @param config.disableAutoRestart {Boolean=} optional, default `false`.
+ *   When `false` (default) ttsignal starts a platform-native path-change
+ *   monitor (NWPathMonitor on macOS, NETLINK_ROUTE on Linux,
+ *   NotifyIpInterfaceChange on Windows) and automatically restarts the
+ *   underlying UDP socket whenever the OS reports a different default
+ *   interface (Wi-Fi <-> ethernet, Wi-Fi <-> wired, VPN up/down). Each
+ *   auto-restart fires the existing `connection.on('restart', cb)` event,
+ *   so application code does NOT need to call `connection.restart()`
+ *   manually. Set `disableAutoRestart: true` for long-lived server
+ *   deployments where the box never roams.
  * @example
- *     var succeed = ttsignal.createConnector(config);
+ *     var connector = ttsignal.createConnector({
+ *         alpn: 'ttsignal',
+ *         disableAutoRestart: false,  // default
+ *     });
  **/
 ttsignal.createConnector = function(config){
     if (typeof config !== 'object') {
@@ -978,7 +1051,7 @@ ttsignal.createServer = function(config){
 // Exports : 
 //*******************************************************************************
 
-module.exports = ttsignal;
+exports.ttsignal = ttsignal;
 
 //*******************************************************************************
 // End of file : ttsignal.js

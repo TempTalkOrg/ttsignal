@@ -19,6 +19,15 @@ cd build && cmake ../src -DCMAKE_BUILD_TYPE=Release -DTARGET_PLATFORM_LINUX=ON &
 
 # Android JNI
 android/scripts/build-so.sh
+
+# iOS xcframework（device arm64 + simulator arm64/x86_64）
+ios/scripts/build-deps.sh         # boringssl + jquic + env，三 slice
+ios/scripts/build-core.sh         # ttsignal core + iOS bridge，三 slice
+ios/scripts/build-xcframework.sh  # 合并为 build/ios-xcframework/TTSignal.xcframework
+
+# iOS 单 slice 调试（最常用）
+build/ios-sim-arm64-release/build      # simulator arm64
+build/ios-device-arm64-release/build   # device arm64
 ```
 
 ## Architecture
@@ -27,7 +36,7 @@ android/scripts/build-so.sh
 
 ```
 src/
-  CMakeLists.txt          — 顶层构建，BUILD_NODE_ADDON / BUILD_JNI 开关
+  CMakeLists.txt          — 顶层构建，BUILD_NODE_ADDON / BUILD_JNI / BUILD_IOS_FRAMEWORK 开关
   cpp/
     Interface.cpp/h       — 核心 QUIC 逻辑入口
     Runtime.cpp/h         — 事件循环和线程管理
@@ -35,15 +44,19 @@ src/
     SMPServer.cpp/h       — 服务端 Server (监听连接)
     SMPParser.cpp/h       — SMP 协议帧解析
     SMPacket.cpp/h        — 数据包序列化
-    UDPSender.cpp/h       — UDP 发送器
+    UDPSender.cpp/h       — UDP 发送器（含 macOS/iOS/Linux/Windows 接口绑定分支）
     Utils.cpp/h           — 工具函数，每次构建自动 touch 以嵌入时间戳
     napi/                 — Node.js N-API 绑定
     jni/                  — Android JNI 绑定
+    apple/                — Apple 平台桥接：AppleNetworkMonitor.mm（iOS+macOS 共用 NWPathMonitor 包装），ios_bridge.mm + ios_logger.mm + module.modulemap（仅 iOS Swift binding）
     http-parser/          — HTTP 头解析 (WebTransport 握手)
+    cmake/
+      ios.toolchain.cmake — iOS 跨编译 toolchain（OS64 / SIMULATOR_ARM64 / SIMULATOR_X64）
   js/
     index.js              — Node.js 胶水层，包装原生类为 EventEmitter
     package.json          — npm 模块定义
   java/                   — Java/Android 接口
+  swift/                  — iOS Swift binding（TTSignalConnector / Connection / Stream / Packet / Config / Handler / Log），与 src/java 一对一对齐
 deps/
   jquic/                  — xquic QUIC 引擎 (核心传输实现)
   boringssl/              — TLS 1.3 加密
@@ -54,6 +67,18 @@ js/
   server.js               — Node.js 服务端示例
   getLogFile.js           — 通过 ttsignal 拉取服务端日志文件
   upload-livekit-bin.js   — 上传 livekit-ai 二进制到服务器
+ios/
+  PLAN_A_EXPERIMENT_REPORT.md  — Apple NWProtocolQUIC 方案 A（已废弃，CID 不兼容）
+  PLAN_C_DESIGN.md             — 方案 C（xquic 移植）设计 + xcframework 集成 + API 对照表
+  QUICTest/                    — iOS 测试 app，依赖 build/ios-xcframework/TTSignal.xcframework
+  QUICTest.xcodeproj/
+  scripts/
+    build-deps.sh              — 编 boringssl/jquic/env 三 slice 静态库
+    build-core.sh              — 编 ttsignal_ios 三 slice
+    build-xcframework.sh       — 合并 device + simulator slice
+build/ios-deps/<sdk>-<arch>/lib/        — build-deps.sh 输出
+build/ios-<slice>-release/dist/         — build-core.sh 输出
+build/ios-xcframework/TTSignal.xcframework — 最终 iOS 产物
 ```
 
 ### Key Concepts
@@ -70,6 +95,16 @@ js/
 - `stream.sendData(buffer)` → 发送二进制数据
 - `stream.getFile({ path })` → RPC: 获取远端文件（用于日志拉取）
 - `stream.on('data', (data, fin) => ...)` → 接收数据
+
+**核心 API (iOS Swift, 与 Android Java 一对一对齐)**：
+- `TTSignalConnector(config: TTSignalConfig)` → 创建 Connector + 启动 NWPathMonitor
+- `connector.createConnection(handler:)` → 创建 Connection
+- `conn.connect(url:, propsJson:, timeoutMs:)` → 发起连接，结果走 `TTSignalHandler.onConnectResult`
+- `TTSignalHandler.onStreamCreated/onRecvCmd/onRecvData/onRestart/...` → 各种回调
+- `Stream.sendCmd / sendData / sendText` → SMP 帧发送
+- `conn.restart(interface: NWInterface?)` → 手动迁移（**通常不调，bridge 内置 NWPathMonitor 自动触发**）
+
+**iOS 切网原理**：`AppleNetworkMonitor` 用 `NWPathMonitor` 监听 active interface 变化 → `if_nametoindex(en0)` → 通过 `TTPathChangeCallback` 触发 `SMPConnection::Restart(ifIndex)` → `UDPSender` 重建 socket 并 `setsockopt(IP_BOUND_IF, ifIndex)` → xquic `jqc_conn_local_addr_changed` 完成 RFC 9000 connection migration。**业务零介入**。
 
 **拥塞控制**：支持 BBR2 (默认)、BBR、CUBIC、Reno、COPA、Unlimited。
 
@@ -100,6 +135,7 @@ ttsignal (本项目) ─────────────────→ rtc-
 | **rtc-client** | `../rtc-client` | rtc-client 的 `src/signaling/client.ts` 和 `src/metrics/log-collector.ts` 调用本项目的 Node.js API (createConnector/createConnection/sendData/getFile) | 修改 NAPI 接口签名、事件名、Stream API、SMP 帧格式时，需同步更新 rtc-client 的 TypeScript 类型声明 (`ttsignal.d.ts`) 和调用代码 |
 | **livekit-ai** | `../livekit-ai` | livekit-ai 的 `pkg/routing/quicrouter.go` 作为 ttsignal 的服务端对等体，接受 ALPN `"ttsignal"` 连接，解析 SMP 帧 | 修改 SMP 帧格式、ALPN 协商流程、连接参数时，需同步更新 livekit-ai 的 Go 侧 QUIC 路由层 |
 | **rtc-dashboard** | `../rtc-dashboard` | rtc-dashboard 的 `pkg/routing` 也实现了 ttsignal 连接接收；`js/upload-livekit-bin.js` 使用本项目上传部署包 | 修改 RPC 命令格式 (TTCmd)、文件传输协议时，需同步更新 rtc-dashboard 的命令路由 |
+| **livekit-client-swift**（未来） | `../livekit-client-swift`（计划中） | LiveKit iOS SDK 通过 `TTSignal.xcframework` + `src/swift/*.swift` 接入 QUIC 信令层，替代 WebSocket 信令 | 修改 iOS 公共 API（TTSignalConnector / Connection / Stream / Handler 协议）时，需同步更新 livekit-client-swift 的 SignalingTransport 实现 |
 
 ### 关键协议约定（跨项目共享）
 

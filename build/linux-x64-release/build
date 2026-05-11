@@ -2,6 +2,27 @@
 
 script_dir=$(dirname $(realpath $0))
 
+# 检查 cross gcc 版本：< 8 时不支持 -ffile-prefix-map，发行产物的 .rodata
+# 中会残留 /Users/<开发者>/chative/ttsignal/... 这种绝对路径（来自 __FILE__
+# 宏）。aarch64 toolchain 已是 13.x，x64 默认还停留在 7.2，需要手动升级。
+xgcc=/opt/homebrew/bin/x86_64-unknown-linux-gnu-gcc
+if [ -x "${xgcc}" ]; then
+    xgcc_ver=$("${xgcc}" -dumpversion 2>/dev/null | cut -d. -f1)
+    if [ -n "${xgcc_ver}" ] && [ "${xgcc_ver}" -lt 8 ]; then
+        cat <<EOF >&2
+============================================================
+WARNING: $(${xgcc} -dumpversion) is too old to support -ffile-prefix-map.
+         The produced .node will still embed the developer's absolute
+         path (incl. username) inside __FILE__ string literals.
+         To fix, upgrade the cross toolchain:
+           brew uninstall x86_64-unknown-linux-gnu
+           brew install messense/macos-cross-toolchains/x86_64-unknown-linux-gnu
+         Then re-run this script.
+============================================================
+EOF
+    fi
+fi
+
 cd ${script_dir}
 cp -rf ${script_dir}/../../src/js/index.js ${script_dir}/../../node_modules/ttsignal/
 cmake   -DCMAKE_BUILD_TYPE=Release \
@@ -9,5 +30,6 @@ cmake   -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE=${script_dir}/../../src/cpp/cmake/linux.x64.toolchain.cmake \
         ${script_dir}/../../src
 make -j8
-# strip
-/opt/homebrew/bin/x86_64-unknown-linux-gnu-strip ${script_dir}/../../node_modules/ttsignal/Release/ttsignal.linux.x64.node
+# strip — CMake 输出实际位于 node_modules/ttsignal/dist/build/Release/，
+# 历史脚本指向 node_modules/ttsignal/Release/ 是 typo，导致 strip 一直 No such file
+/opt/homebrew/bin/x86_64-unknown-linux-gnu-strip ${script_dir}/../../node_modules/ttsignal/dist/build/Release/ttsignal.linux.x64.node

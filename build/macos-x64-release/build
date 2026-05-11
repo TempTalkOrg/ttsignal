@@ -7,3 +7,9 @@ cmake   -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE=${script_dir}/../../src/cpp/cmake/macos.x64.toolchain.cmake \
     ${script_dir}/../../src
 make -j8
+
+# strip -S 删掉 Mach-O debug symbol table（含 N_OSO STAB）。
+# CMake 的 -ffile-prefix-map 修复了源码内 __FILE__ 字符串，但 ld 仍会把
+# 静态库 .o 的绝对来源（例如 deps/boringssl/lib/.../libssl.a(d1_both.cc.o)）
+# 以 N_OSO 形式写入符号表，必须在链接后清理。
+strip -S ${script_dir}/../../node_modules/ttsignal/dist/build/Release/ttsignal.darwin.x64.node

@@ -14,6 +14,23 @@ include(sources.cmake)
 enable_language(C)
 enable_language(CXX)
 
+# 兜底：避免 __FILE__ / DWARF 把构建机绝对路径（含用户名）编进 libcrypto.a /
+# libssl.a。boringssl 在 ssl/crypto 各处用 OPENSSL_PUT_ERROR 等内部宏展开
+# __FILE__，是发行产物里数量最多的路径泄露源。重复添加 prefix-map 是无害的。
+include(CheckCCompilerFlag)
+get_filename_component(_TT_REPO_ROOT_BSSL "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+if (NOT MSVC)
+    check_c_compiler_flag("-ffile-prefix-map=/x=." TT_BSSL_HAS_FFILE_PREFIX_MAP)
+    if (TT_BSSL_HAS_FFILE_PREFIX_MAP)
+        add_compile_options("-ffile-prefix-map=${_TT_REPO_ROOT_BSSL}=.")
+    else()
+        check_c_compiler_flag("-fdebug-prefix-map=/x=." TT_BSSL_HAS_FDEBUG_PREFIX_MAP)
+        if (TT_BSSL_HAS_FDEBUG_PREFIX_MAP)
+            add_compile_options("-fdebug-prefix-map=${_TT_REPO_ROOT_BSSL}=.")
+        endif()
+    endif()
+endif()
+
 # This is a dummy target which all other targets depend on (manually - see other
 # CMakeLists.txt files). This gives us a hook to add any targets which need to
 # run before all other targets.

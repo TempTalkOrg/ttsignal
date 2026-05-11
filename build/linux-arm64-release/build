@@ -9,5 +9,6 @@ cmake   -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TOOLCHAIN_FILE=${script_dir}/../../src/cpp/cmake/linux.arm64.toolchain.cmake \
         ${script_dir}/../../src
 make -j8
-# strip
-/opt/homebrew/bin/aarch64-unknown-linux-gnu-strip ${script_dir}/../../node_modules/ttsignal/Release/ttsignal.linux.arm64.node
+# strip — CMake 输出实际位于 node_modules/ttsignal/dist/build/Release/，
+# 历史脚本指向 node_modules/ttsignal/Release/ 是 typo，导致 strip 一直 No such file
+/opt/homebrew/bin/aarch64-unknown-linux-gnu-strip ${script_dir}/../../node_modules/ttsignal/dist/build/Release/ttsignal.linux.arm64.node

@@ -218,6 +218,19 @@ private:
 	bool 					m_bCheckAvailable;
 	int32_t 				m_nCheckAvailableTimerId;
 	uint32_t 				m_nRecvDataCount;
+	// Platform-overloaded handle used by _InitSocket() to bind the UDP socket
+	// to a specific network interface during connection migration:
+	//   * Android : opaque uint64_t network_handle_t (consumed by
+	//               android_setsocknetwork(handle, fd))
+	//   * iOS     : kernel ifIndex (consumed by setsockopt(IP_BOUND_IF))
+	//   * macOS   : kernel ifIndex (consumed by setsockopt(IP_BOUND_IF))
+	//   * Linux   : kernel ifIndex (consumed by setsockopt(IP_UNICAST_IF),
+	//               host byte order — no htonl)
+	//   * Windows : NET_IFINDEX    (consumed by setsockopt(IP_UNICAST_IF),
+	//               IPv4 byte-swapped via htonl, IPv6 host order)
+	// Always int64 in storage so a single Restart() signature works for both
+	// the Android handle path and the ifIndex platforms. Zero means "don't
+	// bind" — OS picks default.
 	int64_t 				m_nNetworkHandle;
 };
 

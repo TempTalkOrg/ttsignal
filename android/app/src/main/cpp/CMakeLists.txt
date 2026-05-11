@@ -13,6 +13,24 @@ project("signal")
 
 set(BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# 把构建机绝对路径前缀替换成相对路径，避免 __FILE__ / __builtin_FILE() / DWARF
+# 把开发者用户名（/Users/<name>/... 或 /home/<name>/...）和仓库位置编进 .so。
+# 必须在 add_subdirectory(deps/...) 之前调用以传给 deps。
+# Android NDK r21+ 自带 clang 都支持 -ffile-prefix-map；为统一起见仍做检测。
+include(CheckCCompilerFlag)
+get_filename_component(_TT_REPO_ROOT "${BASE_DIR}/../../../../.." ABSOLUTE)
+if (NOT MSVC)
+    check_c_compiler_flag("-ffile-prefix-map=/x=." TT_HAS_FFILE_PREFIX_MAP)
+    if (TT_HAS_FFILE_PREFIX_MAP)
+        add_compile_options("-ffile-prefix-map=${_TT_REPO_ROOT}=.")
+    else()
+        check_c_compiler_flag("-fdebug-prefix-map=/x=." TT_HAS_FDEBUG_PREFIX_MAP)
+        if (TT_HAS_FDEBUG_PREFIX_MAP)
+            add_compile_options("-fdebug-prefix-map=${_TT_REPO_ROOT}=.")
+        endif()
+    endif()
+endif()
+
 add_subdirectory(${BASE_DIR}/../../../../../deps/env/src deps/env.dir)
 add_subdirectory(${BASE_DIR}/../../../../../deps/boringssl/src deps/boringssl.dir)
 add_subdirectory(${BASE_DIR}/../../../../../deps/jquic deps/jquic.dir)

@@ -12,6 +12,44 @@
 #include <dlfcn.h>
 #include <cerrno>
 #endif
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+// IP_BOUND_IF / IPV6_BOUND_IF — bind a socket to a specific network interface
+// by ifIndex (returned by NWPathMonitor / if_nametoindex). Shared by iOS and
+// macOS: iOS picks cellular vs wifi, macOS picks ethernet vs wifi vs VPN.
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <cerrno>
+#endif
+#if defined(__linux__) && !defined(OS_ANDROID)
+// IP_UNICAST_IF / IPV6_UNICAST_IF — Linux equivalent of IP_BOUND_IF. Index
+// is in HOST byte order on Linux (no htonl, unlike Windows). Used by the
+// LinuxNetlinkMonitor restart path.
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <cerrno>
+// IPV6_UNICAST_IF was added to the Linux kernel uapi headers in 5.7. Older
+// cross-toolchain sysroots (e.g. the homebrew aarch64-unknown-linux-gnu
+// bottle, which still ships pre-5.7 headers) don't declare it even though
+// any reasonably recent runtime kernel implements it. The numeric value is
+// stable kernel ABI (linux/in6.h: #define IPV6_UNICAST_IF 76), so define
+// it ourselves when the toolchain headers fall short.
+#ifndef IPV6_UNICAST_IF
+#define IPV6_UNICAST_IF 76
+#endif
+#endif
+#if defined(_WIN32)
+// IP_UNICAST_IF / IPV6_UNICAST_IF — Windows equivalent. Per Microsoft docs,
+// IPv4 ifIndex must be passed in NETWORK byte order (htonl); IPv6 is in
+// host order. Used by the WinIpChangeMonitor restart path.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <cerrno>
+#endif
 
 
 
@@ -316,6 +354,76 @@ BCRESULT UDPSender::_InitSocket()
 			LogQ(m_pLoggerCtx, _WARN_,
 				"UDP Sender: android_setsocknetwork not found via dlsym");
 		}
+	}
+#elif defined(__APPLE__)
+	// macOS + iOS: bind the UDP socket to a specific interface so the kernel
+	// stops following the system "best path" automatically. The caller
+	// (AppleNetworkMonitor) passes an ifIndex from if_nametoindex() through
+	// the SMPConnection::Restart -> UDPSender::Restart chain as
+	// m_nNetworkHandle. IP_BOUND_IF is the Apple equivalent of Android's
+	// android_setsocknetwork.
+	if (m_nNetworkHandle != 0)
+	{
+		uint32_t ifIndex = (uint32_t)m_nNetworkHandle;
+		int fd = m_pSocket->GetFd();
+		int retV4 = setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &ifIndex, sizeof(ifIndex));
+		int errV4 = (retV4 == 0) ? 0 : errno;
+		int retV6 = 0;
+		int errV6 = 0;
+		if (m_sConfig.ipv6)
+		{
+			retV6 = setsockopt(fd, IPPROTO_IPV6, IPV6_BOUND_IF, &ifIndex, sizeof(ifIndex));
+			errV6 = (retV6 == 0) ? 0 : errno;
+		}
+		LogQ(m_pLoggerCtx, _DEBUG_,
+			"UDP Sender: setsockopt(IP_BOUND_IF, ifIndex=%u, fd=%d) v4=%d/errno=%d v6=%d/errno=%d",
+			ifIndex, fd, retV4, errV4, retV6, errV6);
+	}
+#elif defined(__linux__) && !defined(OS_ANDROID)
+	// Linux (non-Android): bind via IP_UNICAST_IF. Caller (LinuxNetlinkMonitor)
+	// passes ifIndex obtained from RTM_GETROUTE/RTA_OIF in m_nNetworkHandle.
+	// Index is in HOST byte order on Linux — DO NOT htonl here (Windows is
+	// the only platform that requires byte-swapping).
+	if (m_nNetworkHandle != 0)
+	{
+		uint32_t ifIndex = (uint32_t)m_nNetworkHandle;
+		int fd = m_pSocket->GetFd();
+		int retV4 = setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, &ifIndex, sizeof(ifIndex));
+		int errV4 = (retV4 == 0) ? 0 : errno;
+		int retV6 = 0;
+		int errV6 = 0;
+		if (m_sConfig.ipv6)
+		{
+			retV6 = setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, &ifIndex, sizeof(ifIndex));
+			errV6 = (retV6 == 0) ? 0 : errno;
+		}
+		LogQ(m_pLoggerCtx, _DEBUG_,
+			"UDP Sender: setsockopt(IP_UNICAST_IF, ifIndex=%u, fd=%d) v4=%d/errno=%d v6=%d/errno=%d",
+			ifIndex, fd, retV4, errV4, retV6, errV6);
+	}
+#elif defined(_WIN32)
+	// Windows: IP_UNICAST_IF requires the IPv4 ifIndex in NETWORK byte order
+	// (htonl). IPv6 stays in host order. Caller (WinIpChangeMonitor) supplies
+	// ifIndex from GetBestInterfaceEx in m_nNetworkHandle.
+	if (m_nNetworkHandle != 0)
+	{
+		DWORD ifIndex = (DWORD)m_nNetworkHandle;
+		DWORD ifIndexBE = htonl(ifIndex);
+		int fd = m_pSocket->GetFd();
+		int retV4 = setsockopt((SOCKET)fd, IPPROTO_IP, IP_UNICAST_IF,
+			(const char*)&ifIndexBE, sizeof(ifIndexBE));
+		int errV4 = (retV4 == 0) ? 0 : WSAGetLastError();
+		int retV6 = 0;
+		int errV6 = 0;
+		if (m_sConfig.ipv6)
+		{
+			retV6 = setsockopt((SOCKET)fd, IPPROTO_IPV6, IPV6_UNICAST_IF,
+				(const char*)&ifIndex, sizeof(ifIndex));
+			errV6 = (retV6 == 0) ? 0 : WSAGetLastError();
+		}
+		LogQ(m_pLoggerCtx, _DEBUG_,
+			"UDP Sender: setsockopt(IP_UNICAST_IF, ifIndex=%u, fd=%d) v4=%d/wsa=%d v6=%d/wsa=%d",
+			(unsigned)ifIndex, fd, retV4, errV4, retV6, errV6);
 	}
 #endif
 	char local_addr_str_[128];

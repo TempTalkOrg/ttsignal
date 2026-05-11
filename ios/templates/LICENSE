@@ -1,0 +1,14 @@
+TTSignal — Proprietary License (placeholder)
+============================================
+
+Copyright (c) 2026 Chative. All rights reserved.
+
+This software is provided as-is for use by authorized licensees only.
+Redistribution, reverse engineering, or modification of this software
+(including the bundled `TTSignal.xcframework` binary, the Swift wrapper
+sources under `Sources/TTSignal/`, and any associated documentation) is
+prohibited without prior written consent from the copyright holder.
+
+NOTE TO MAINTAINERS: this is a placeholder LICENSE shipped in the
+ios/templates/ tree of the upstream `ttsignal` repo. Replace it with
+the project's actual license text before the first public release.

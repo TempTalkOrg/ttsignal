@@ -349,6 +349,11 @@ public:
 	BCRESULT		GetSockName(BCSockAddrS *addressp);
 	void			Cancel(BCTask *task, uint32_t how);
 	BCSocketTypeE	GetType();
+	// Mirror linux/BCSocket.h — UDPSender::_InitSocket needs the underlying
+	// SOCKET fd to call setsockopt(IP_UNICAST_IF) when binding to a specific
+	// network interface during connection migration. SOCKET is implicitly
+	// convertible to int but we cast for log formatting elsewhere.
+	int				GetFd() const { return (int)m_nFD; }
 	BOOL			IsBound();
 	void			IPv6only(BOOL yes);
 	void			SetName(const char *szName, void *pTag);

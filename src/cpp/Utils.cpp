@@ -254,6 +254,51 @@ int32_t XQCLogLevelToBCLogLevel(int32_t lvl)
     return level;
 }
 
+int32_t BCLogLevelToLogLevel(int32_t lvl)
+{
+    int32_t level = LOG_LEVEL_INFO;
+    switch (lvl)
+    {
+        case _FATAL_:
+            level = LOG_LEVEL_FATAL;
+            break;
+        case _ERROR_:
+            level = LOG_LEVEL_ERROR;
+            break;
+        case _WARN_:
+            level = LOG_LEVEL_WARN;
+            break;
+        case _INFO_:
+            level = LOG_LEVEL_INFO;
+            break;
+        case _DEBUG_:
+            level = LOG_LEVEL_DEBUG;
+            break;
+        default:
+            level = LOG_LEVEL_INFO;
+            break;
+    }
+    return level;
+}
+
+int32_t LogLevelToBCLogLevel(int32_t level)
+{
+    switch (level)
+    {
+        case LOG_LEVEL_FATAL:
+            return _FATAL_;
+        case LOG_LEVEL_ERROR:
+            return _ERROR_;
+        case LOG_LEVEL_WARN:
+            return _WARN_;
+        case LOG_LEVEL_INFO:
+            return _INFO_;
+        case LOG_LEVEL_DEBUG:
+            return _DEBUG_;
+    }
+    return _INFO_;
+}
+
 void
 LogQ(const void *logger_ctx, int32_t nLevel, const char* szFmtStr, ...)
 {

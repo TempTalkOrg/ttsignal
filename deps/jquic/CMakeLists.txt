@@ -19,6 +19,30 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# 兜底：避免 __FILE__ / DWARF 把构建机绝对路径（含用户名）编进 libjquic.a。
+# 重复添加 prefix-map 是无害的；当 iOS 通过 build-deps.sh 直接编 jquic 时这是
+# 唯一的注入入口。
+include(CheckCCompilerFlag)
+get_filename_component(_TT_REPO_ROOT_JQUIC "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+if (NOT MSVC)
+    check_c_compiler_flag("-ffile-prefix-map=/x=." TT_JQUIC_HAS_FFILE_PREFIX_MAP)
+    if (TT_JQUIC_HAS_FFILE_PREFIX_MAP)
+        add_compile_options("-ffile-prefix-map=${_TT_REPO_ROOT_JQUIC}=.")
+    else()
+        check_c_compiler_flag("-fdebug-prefix-map=/x=." TT_JQUIC_HAS_FDEBUG_PREFIX_MAP)
+        if (TT_JQUIC_HAS_FDEBUG_PREFIX_MAP)
+            add_compile_options("-fdebug-prefix-map=${_TT_REPO_ROOT_JQUIC}=.")
+        endif()
+    endif()
+    # jquic 的 CMakeLists 在下面无条件加了 -g（即使 Release 模式），导致 .a
+    # 中的 .o 仍嵌入 DWARF 的 DW_AT_comp_dir = cmake build 目录绝对路径。
+    # 用 add_compile_options(-g0) 在 CMAKE_C_FLAGS 之后追加来覆盖（多个 -g*
+    # 最后一个生效）。仅对非 Debug 构建生效，保留 Debug 调试能力。
+    if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        add_compile_options(-g0)
+    endif()
+endif()
+
 set(SSL_TYPE "boringssl")
 set(SSL_INC_PATH "../boringssl/src/include")
 set(XQC_ENABLE_BBR2 true)

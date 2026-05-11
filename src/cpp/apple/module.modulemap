@@ -1,0 +1,13 @@
+// TTSignalC — Clang module that exposes the bridge's C headers to Swift.
+// Swift code in src/swift/ does `import TTSignalC` (no bridging header,
+// no umbrella header needed).
+//
+// The framework target packaged for distribution must include this file
+// at Modules/module.modulemap inside TTSignal.xcframework.
+module TTSignalC {
+    header "ios_bridge.h"
+    header "INetworkPathMonitor.h"
+    header "AppleNetworkMonitor.h"
+    header "ios_logger.h"
+    export *
+}

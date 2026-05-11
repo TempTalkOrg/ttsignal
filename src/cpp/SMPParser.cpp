@@ -6,11 +6,11 @@
 #include "StdAfx.h"
 #include "SMPParser.h"
 #include <assert.h>
-#ifdef OS_MAC
+#if defined(OS_APPLE) || defined(OS_MAC) || defined(OS_IOS)
 #include <malloc/malloc.h> // realloc
-#else // OS_MAC
+#else
 #include <malloc.h> // realloc
-#endif // OS_MAC
+#endif
 #include <memory.h> // memcpy, memmove
 #include <stdio.h> // printf
 
