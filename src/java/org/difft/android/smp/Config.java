@@ -1,0 +1,55 @@
+/// ////////////////////////////////////////////////////////////////////////////
+// file : Config.java
+// author : antoniozhou
+/// ////////////////////////////////////////////////////////////////////////////
+
+package org.difft.android.smp;
+
+
+public class Config {
+    public interface LogHandler {
+        public void log(int level, String msg);
+    }
+
+    // Connector use config properties
+    public String hostname = "localhost";
+    // Server use config properties
+    public int port = 8003;
+    public int backlog = 1000;
+    public boolean reusePort = false;
+    public boolean ssl = false;
+    public String privateKeyFile = "";
+    public String certificateFile = "";
+    // Server/Connector both use the same config properties
+    public int taskThreads = 16;
+    public int timerThreads = 4;
+    // connection idle time out in milliseconds
+    public int idleTimeOut = 20000;
+    public String alpn = "ttsignal";
+    public int maxConnections = 1000;
+    public int congestCtrl = 'B';
+    // ping on switch
+    public boolean pingOn = false;
+    // ping interval, in milliseconds
+    public int pingInterval = 10000;
+    // active connection id limit
+    public int activeConnectionIdLimit = 1000;
+    // device type, 1 : phone, 2 : PC
+    public int deviceType = 0;
+    // cid tag
+    public String cidTag = "";
+    public String logFile = "";
+    public LogHandler logHandler = null;
+    // Log level, error : E, info : I, debug : D, trace : T, warn : W
+    public int logLevel = 0;
+    // number of senders
+    public int numOfSenders = 1;
+    // Logical hostname for TLS SNI and certificate hostname verification (IP direct scenario)
+    public String serverHost = "";
+    // Self-signed root CA certificate in PEM format for custom certificate chain verification
+    public String caCertPem = "";
+
+    public Config() {
+        // Default constructor
+    }
+}

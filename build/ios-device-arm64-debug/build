@@ -1,0 +1,17 @@
+#!/bin/bash
+# Convenience wrapper — builds only this single iOS slice (device arm64) in
+# Debug mode. Pairs with `BUILD_TYPE=Debug ios/scripts/build-xcframework.sh`
+# to assemble a debuggable TTSignal.xcframework for QUICTest.
+set -e
+script_dir=$(dirname $(realpath $0))
+repo_root="${script_dir}/../.."
+
+cd "${script_dir}"
+cmake -DBUILD_IOS_FRAMEWORK=ON \
+      -DCMAKE_TOOLCHAIN_FILE="${repo_root}/src/cpp/cmake/ios.toolchain.cmake" \
+      -DIOS_PLATFORM=OS64 \
+      -DIOS_DEPLOYMENT_TARGET=13.0 \
+      -DCMAKE_BUILD_TYPE=Debug \
+      -DIOS_DEPS_DIR="${repo_root}/build/ios-deps/iphoneos-arm64/lib" \
+      "${repo_root}/src"
+cmake --build . --target ttsignal_ios -j8

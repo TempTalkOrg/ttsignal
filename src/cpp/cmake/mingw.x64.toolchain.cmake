@@ -1,0 +1,27 @@
+# mingw-toolchain.cmake
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+
+# 指定交叉编译工具
+set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc)
+set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++)
+set(CMAKE_RC_COMPILER x86_64-w64-mingw32-windres)
+
+# 目标环境路径
+set(CMAKE_FIND_ROOT_PATH /opt/homebrew/opt/mingw-w64/toolchain-x86_64)
+
+# 调整默认行为
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+
+# 针对该项目的特殊设置
+add_definitions(
+    -D__STDC_LIMIT_MACROS 
+    -DCR_USE_FALLBACKS_FOR_GCC_WITH_LIBCXX
+    -DNOMINMAX
+    -DXQC_ENABLE_BBR2
+    -DXQC_ENABLE_RENO
+    -DXQC_ENABLE_UNLIMITED
+    -DXQC_ENABLE_COPA
+)

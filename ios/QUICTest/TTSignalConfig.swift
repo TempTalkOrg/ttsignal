@@ -1,0 +1,1 @@
+../../src/swift/TTSignalConfig.swift

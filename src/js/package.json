@@ -1,0 +1,30 @@
+{
+  "name": "ttsignal",
+  "description": "ttsignal node.js addon",
+  "version": "1.0.0",
+  "homepage": "http://github.com/anto/ttsignal",
+  "author": {
+    "name": "anto"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/anto/ttsignal.git"
+  },
+  "devDependencies": {
+    "step": "*",
+    "expresso": "*"
+  },
+  "engines": {
+    "node": ">= 18.0.0"
+  },
+  "licenses": [
+    {
+      "type": "ICPL"
+    }
+  ],
+  "main": "./index.js",
+  "gypfile": true,
+  "readme": "# NAME\n\nnode-ttsignal.\n",
+  "_id": "ttsignal@1.0.0",
+  "_from": "ttsignal"
+}
