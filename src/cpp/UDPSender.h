@@ -157,6 +157,24 @@ protected:
 	void			_Cleanup();
 	BOOL			_ExitCheck();
 	void			_Restart();
+	// If the current UDP socket is pinned to a specific physical interface
+	// (Apple IP_BOUND_IF / Windows + Linux IP_UNICAST_IF / Android
+	// android_setsocknetwork) and either (a) the kernel reported
+	// "network unreachable" / "address not available" / "host unreachable"
+	// on this socket, or (b) the proactive route-table check in Connect()
+	// found the peer routes through a different interface, the pin is the
+	// reason we can't reach the peer (typical case: Clash / Surge / V2Ray
+	// TUN mode resolves the server hostname to a fake-IP whose route only
+	// exists on the proxy adapter; pinning the socket to the physical NIC
+	// strands the fake-IP — and on Windows even forces the source IP to
+	// the wrong interface, which the proxy's stateful NAT can't undo).
+	// Clear the pin in-place so the kernel falls back to default routing
+	// on the next send. Returns true if the pin was just cleared, false
+	// if there was nothing to clear or the platform doesn't support
+	// runtime un-pinning (currently only Android — its hard pin via
+	// android_setsocknetwork has no public API to undo). Caller must
+	// hold m_sLock.
+	bool			_TryClearInterfaceBinding(BCRESULT triggerResult);
 	void			_UDP_RecvChunk();
 	BCRESULT		_UDP_Send(
 						BCSockAddrS &refSockAddr, 
@@ -232,6 +250,14 @@ private:
 	// the Android handle path and the ifIndex platforms. Zero means "don't
 	// bind" — OS picks default.
 	int64_t 				m_nNetworkHandle;
+	// Set true by _InitSocket() after a successful platform-specific bind
+	// (setsockopt(IP_BOUND_IF / IP_UNICAST_IF) or android_setsocknetwork).
+	// Reset to false by _TryClearInterfaceBinding() once we've decided to
+	// un-pin because the route is unreachable on the pinned interface, and
+	// also reset (implicitly via re-bind) on the next _InitSocket() call.
+	// Guards _TryClearInterfaceBinding from un-pinning twice per socket
+	// life so we don't flap setsockopt under a flood of NETUNREACH errors.
+	bool 					m_bInterfaceBindingActive;
 };
 
 #endif // UDPSENDER_H_INCLUDED__

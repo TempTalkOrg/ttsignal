@@ -6,10 +6,15 @@ cmake_minimum_required(VERSION 3.10)
 
 set(TT_LINUX_MONITOR_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/LinuxNetlinkMonitor.cpp
+    # Kernel route-table query helper. Implements tt_route_lookup_ifindex
+    # declared in src/cpp/NetworkRouteLookup.h. UDPSender uses it on the
+    # Linux non-Android NAPI build to validate IP_UNICAST_IF hints.
+    ${CMAKE_CURRENT_SOURCE_DIR}/LinuxRouteLookup.cpp
 )
 
 set(TT_LINUX_MONITOR_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/LinuxNetlinkMonitor.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../NetworkRouteLookup.h
 )
 
 set(TT_LINUX_MONITOR_SOURCES        ${TT_LINUX_MONITOR_SRC}     PARENT_SCOPE)

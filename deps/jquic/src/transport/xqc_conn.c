@@ -71,6 +71,10 @@ xqc_conn_settings_t default_conn_settings = {
 
     .recv_rate_bytes_per_sec    = 0,
     .enable_stream_rate_limit   = 0,
+    /* ttsignal: keep at least 4 unused client SCIDs on the peer side at all times,
+     * so that NAT rebinding / path migration always has a fresh CID available for
+     * the peer to validate the new 5-tuple (see xqc_conn_try_add_new_conn_id). */
+    .least_available_cid_count  = 4,
 
     .scheduler_params           = {
                                     .bw_Bps_thr = 375000, 
@@ -384,6 +388,18 @@ xqc_conn_init_trans_settings(xqc_connection_t *conn)
     ls->max_idle_timeout = conn->conn_settings.idle_time_out;
 
     ls->max_udp_payload_size = XQC_CONN_MAX_UDP_PAYLOAD_SIZE;
+    /* MASQUE/tunnelled connections set a reduced max_pkt_out_size so their own
+     * packets fit one outer HTTP/3 datagram. Advertise that same size as our
+     * receive limit (max_udp_payload_size) so the peer caps the packets it sends
+     * us to a size that also fits the tunnel on the RETURN path (otherwise the
+     * server can send up to 1500B packets that no longer fit one outer datagram
+     * and get dropped, stalling renegotiation). Direct connections keep the
+     * default (their max_pkt_out_size == XQC_QUIC_MIN_MSS, so they're excluded). */
+    if (conn->conn_settings.max_pkt_out_size > XQC_QUIC_MIN_MSS
+        && conn->conn_settings.max_pkt_out_size < ls->max_udp_payload_size)
+    {
+        ls->max_udp_payload_size = conn->conn_settings.max_pkt_out_size;
+    }
 
     if (conn->conn_settings.active_connection_id_limit == 0) {
         ls->active_connection_id_limit = XQC_CONN_ACTIVE_CID_LIMIT;
@@ -394,7 +410,12 @@ xqc_conn_init_trans_settings(xqc_connection_t *conn)
     ls->multipath_version = conn->conn_settings.multipath_version;
 
     ls->max_datagram_frame_size = conn->conn_settings.max_datagram_frame_size;
-    ls->disable_active_migration = ls->enable_multipath ? 0 : 1;
+    /* ttsignal: do not falsely advertise disable_active_migration in non-multipath mode.
+     * xquic supports RFC 9000 §9 client-initiated path migration via
+     * jqc_conn_local_addr_changed + xqc_conn_send_path_challenge, so setting this
+     * transport parameter would be a protocol violation that may cause strict
+     * servers to refuse the subsequent PATH_CHALLENGE. */
+    ls->disable_active_migration = 0;
 
     ls->max_ack_delay = conn->conn_settings.max_ack_delay;
 }
@@ -4374,9 +4395,14 @@ xqc_conn_try_add_new_conn_id(xqc_connection_t *conn, uint64_t retire_prior_to)
     uint64_t unused_limit = 1;
 #else
     uint64_t unused_limit = conn->enable_multipath ? 2 : 1;
-    if (conn->enable_multipath) {
-        unused_limit = xqc_max(unused_limit, conn->conn_settings.least_available_cid_count);
-    }
+    /* ttsignal: honor least_available_cid_count regardless of multipath mode.
+     * In non-multipath setups path migration (NAT rebinding via
+     * jqc_conn_local_addr_changed) still consumes one client-issued NEW_CONNECTION_ID
+     * per migration on the peer side. Keeping only 1 unused easily makes the peer's
+     * connection-ID pool empty during the migration window, causing it to silently
+     * skip PATH_CHALLENGE/PATH_RESPONSE (cf. quic-go path_manager.go "NO CONNECTION
+     * ID available"). Allow callers to configure a larger headroom. */
+    unused_limit = xqc_max(unused_limit, conn->conn_settings.least_available_cid_count);
 #endif
     if (xqc_conn_is_handshake_confirmed(conn)) {
         while (active_cid_cnt < conn->remote_settings.active_connection_id_limit

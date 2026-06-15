@@ -19,6 +19,7 @@ import org.difft.android.smp.*
 import java.nio.ByteBuffer
 import java.nio.charset.Charset
 import java.util.Timer
+import java.util.TimerTask
 
 class MainActivity : AppCompatActivity() {
 
@@ -28,8 +29,24 @@ class MainActivity : AppCompatActivity() {
     private lateinit var logScrollView: ScrollView
     private var connector: Connector? = null
     private var connection: Connection? = null
+    @Volatile
+    private var activeStream: Stream? = null
     private var messageTimer: Timer? = null
     private var messageCounter = 0
+
+    // Payload sizes taken straight from the LiveKit SignalClient logs so the
+    // demo's traffic shape matches what we observed there.
+    //
+    // 1. Right after the join stream opens, the signaling layer flushes a
+    //    queue of SignalRequests (TTCallRequest, AddTrack, sync state, etc.).
+    private val initialBurstSizes = intArrayOf(173, 457, 485, 171, 44, 1729, 27, 1040)
+    // 2. The brief moment between onLost+onAvailable and the actual
+    //    connection.restart() call, where the queued small SignalRequests get
+    //    flushed onto the still-pre-migration socket.
+    private val preRestartBurstSizes = intArrayOf(175, 196, 173, 193)
+    // 3. Right after onRestart fires, RTCEngine triggers ICE restart which
+    //    pushes an SDP offer (~2.5 KB) followed by a small ack/sync.
+    private val postRestartBurstSizes = intArrayOf(2626, 23)
 
     private var connectivityManager: ConnectivityManager? = null
 
@@ -71,11 +88,13 @@ class MainActivity : AppCompatActivity() {
             appendLog("[网络] 能力变化 transports=$transports network=$network")
             activeNetwork = network
 
-            if (network == pendingRestartNetwork
-                && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+            if (network == pendingRestartNetwork) {
                 pendingRestartNetwork = null
                 connection?.let {
                     val networkHandle = network.networkHandle
+                    // Match LiveKit's pattern: a small flush of queued
+                    // SignalRequests happens right before restart() is called.
+                    sendBurst("pre-restart", preRestartBurstSizes)
                     appendLog("[网络] 网络已验证，执行 restart network=$network networkHandle=$networkHandle")
                     it.restart(networkHandle)
                 }
@@ -139,9 +158,9 @@ class MainActivity : AppCompatActivity() {
                 binding.closeButton.isEnabled = false
             }
             connection = null
+            activeStream = null
             needRestart = false
-            messageTimer?.cancel()
-            messageTimer = null
+            stopBackgroundSenders()
         }
     }
 
@@ -198,15 +217,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun createConnection(connector: Connector, url: String) {
         val config = Config()
-        config.idleTimeOut = 20000
+        config.idleTimeOut = 10000
+        config.pingInterval = 5000
         config.hostname = "localhost"
         config.port = 8003
-        config.maxConnections = 1000
+        config.maxConnections = 1
         config.congestCtrl = Const.CC_BBR2
         config.pingOn = true
-        config.alpn = "ttsignal-ip"
+        config.alpn = "ttsignal"
         config.deviceType = 1
         config.cidTag = "12345678900"
+        config.alpn = "ttsignal"
+        config.serverHost = "tlivekit9tcew3gy.test.chative.im"
 
         val charset = Charset.forName("UTF-8")
         connection?.close()
@@ -227,19 +249,6 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread {
                         binding.closeButton.isEnabled = true
                     }
-//                    messageTimer?.cancel()
-//                    messageTimer = Timer()
-//                    messageCounter = 0
-//                    messageTimer?.schedule(object : TimerTask() {
-//                        override fun run() {
-//                            connection?.let {
-//                                val stream = it.createStream()
-//                                val msg = "ping from client ${++messageCounter}"
-//                                stream.sendText(msg)
-//                                appendLog("Sent message: $msg")
-//                            }
-//                        }
-//                    }, 0, 2000)
                 } else {
                     appendLog("连接失败")
                 }
@@ -247,11 +256,22 @@ class MainActivity : AppCompatActivity() {
 
             override fun onStreamCreated(conn: Connection?, stream: Stream) {
                 appendLog("新建流: " + stream.id())
+                activeStream = stream
                 stream.sendText("text send from client")
+                // LiveKit's traffic shape:
+                //   - one initial burst once the join stream is up
+                //   - 5s ping pair forever
+                //   - no other periodic bursts; the next big payload is
+                //     event-driven (pre/post network migration only)
+                sendBurst("connect", initialBurstSizes)
+                startPeriodicPings()
             }
 
             override fun onStreamClosed(conn: Connection?, stream: Stream) {
                 appendLog("流关闭: " + stream.id())
+                if (activeStream?.id() == stream.id()) {
+                    activeStream = null
+                }
             }
 
             override fun onStreamDataAcked(conn: Connection?, stream: Stream, ackDelayTime: Long, ackedBytes: Int, inflightBytes: Int) {
@@ -297,8 +317,8 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     binding.closeButton.isEnabled = false
                 }
-                messageTimer?.cancel()
-                messageTimer = null
+                activeStream = null
+                stopBackgroundSenders()
             }
 
             override fun onException(conn: Connection?, errorMsg: String?) {
@@ -306,12 +326,19 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     binding.closeButton.isEnabled = false
                 }
-                messageTimer?.cancel()
-                messageTimer = null
+                activeStream = null
+                stopBackgroundSenders()
             }
 
             override fun onRestart(conn: Connection?, result: Int, address: String?) {
                 appendLog("重连结果: " + result + ", " + address)
+                if (result == 0) {
+                    // LiveKit's RTCEngine triggers ICE restart right after
+                    // onRestart succeeds, which causes negotiatePublisher to
+                    // ship an SDP offer (~2.6 KB) and a small ack right
+                    // after. Reproduce that shape here.
+                    sendBurst("post-restart", postRestartBurstSizes)
+                }
             }
         })
         val stats = Stats()
@@ -331,6 +358,48 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Mirror a LiveKit-style burst on the active stream. Caller picks which
+     * shape (connect / pre-restart / post-restart). Bytes are arbitrary —
+     * QUIC migration behaviour only cares about packet cadence and size.
+     */
+    private fun sendBurst(reason: String, sizes: IntArray) {
+        val stream = activeStream
+        if (stream == null) {
+            appendLog("[burst:$reason] skipped, no active stream")
+            return
+        }
+        sizes.forEach { size ->
+            val payload = ByteArray(size) { (it and 0xFF).toByte() }
+            val r = stream.sendData(payload)
+            appendLog("[burst:$reason] sendData size=$size result=$r")
+        }
+    }
+
+    /**
+     * Mirror SignalClient.sendPing: every 5s push a 7-byte ping followed by
+     * a 13-byte pingReq on the same stream. This is the baseline keep-alive
+     * traffic that runs forever; no other periodic burst exists in LiveKit.
+     */
+    private fun startPeriodicPings() {
+        messageTimer?.cancel()
+        messageTimer = Timer().apply {
+            scheduleAtFixedRate(object : TimerTask() {
+                override fun run() {
+                    val s = activeStream ?: return
+                    val r7 = s.sendData(ByteArray(7) { 0x42 })
+                    val r13 = s.sendData(ByteArray(13) { 0x42 })
+                    appendLog("[ping] 7=$r7 13=$r13")
+                }
+            }, 5_000L, 5_000L)
+        }
+    }
+
+    private fun stopBackgroundSenders() {
+        messageTimer?.cancel()
+        messageTimer = null
+    }
+
     private fun initConnector(): Connector {
         val config = Config()
         config.taskThreads = 1
@@ -338,10 +407,11 @@ class MainActivity : AppCompatActivity() {
         config.idleTimeOut = 20000
         config.alpn = "ttsignal,ttsignal-ip"
         config.hostname = "localhost"
-        config.port = 4433
+        config.port = 443
         config.maxConnections = 1000
         config.congestCtrl = Const.CC_BBR2
         config.pingOn = true
+        config.numOfSenders = 1
 //        config.logFile = "ttclient.log"
         config.logLevel = Const.LOG_INFO
         config.logHandler = object : Config.LogHandler {

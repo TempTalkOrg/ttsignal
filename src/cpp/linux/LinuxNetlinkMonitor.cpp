@@ -107,9 +107,21 @@ static bool IsVirtualIface(const char* name)
 // or ::/0) and walk the multipart reply looking for an RTA_OIF attribute.
 // Returns 0 if nothing usable was found. Family is AF_INET unless we want
 // IPv6.
+//
+// The whole query is bounded to ~1s wall-clock. WSL2's lightweight Linux
+// kernel has at least one reproducible hang on multipart NETLINK_ROUTE
+// replies — the kernel never emits NLMSG_DONE for RTM_GETROUTE with
+// dst_len=0, so a plain blocking recv() loop sleeps forever. This used
+// to wedge tt_netmon_start's synchronous "fire initial callback" path
+// and therefore wedged ttsignal.createConnector() on every WSL2
+// invocation. SOCK_NONBLOCK + poll(timeout) keeps that bounded; if the
+// query times out we just return 0 and let the netlink event reader
+// pick up the route on the next genuine RTM_NEWROUTE / RTM_DELROUTE.
 static int64_t QueryDefaultIfIndex(int family)
 {
-    int sock = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+    int sock = socket(AF_NETLINK,
+                      SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                      NETLINK_ROUTE);
     if (sock < 0) return 0;
 
     struct {
@@ -131,10 +143,41 @@ static int64_t QueryDefaultIfIndex(int family)
 
     char buf[8192];
     int64_t found = 0;
+    bool timed_out = false;
+
+    // Wall-clock budget. Each poll() iteration is at most the remainder
+    // of the 1s budget; if recv() reports EAGAIN we wait again on poll
+    // until the budget is exhausted.
+    auto deadline = std::chrono::steady_clock::now()
+                    + std::chrono::milliseconds(1000);
 
     while (true) {
-        ssize_t len = recv(sock, buf, sizeof(buf), 0);
-        if (len <= 0) break;
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) { timed_out = true; break; }
+        int budget_ms = (int)std::chrono::duration_cast<
+            std::chrono::milliseconds>(deadline - now).count();
+        if (budget_ms <= 0) { timed_out = true; break; }
+
+        struct pollfd pfd = {};
+        pfd.fd     = sock;
+        pfd.events = POLLIN;
+        int pr = poll(&pfd, 1, budget_ms);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) { timed_out = true; break; }
+        if (!(pfd.revents & POLLIN)) {
+            // POLLERR / POLLHUP — treat as "kernel won't reply, give up".
+            break;
+        }
+
+        ssize_t len = recv(sock, buf, sizeof(buf), MSG_DONTWAIT);
+        if (len <= 0) {
+            if (len < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                continue;
+            break;
+        }
 
         for (struct nlmsghdr* nh = (struct nlmsghdr*)buf;
              NLMSG_OK(nh, (size_t)len);
@@ -165,9 +208,24 @@ static int64_t QueryDefaultIfIndex(int family)
                 }
             }
         }
+        // If we got a partial batch with no NLMSG_DONE but already
+        // resolved an RTA_OIF we'd have jumped to done. Otherwise loop
+        // back and poll for more — the budget guards against hangs.
     }
 done:
     close(sock);
+    if (timed_out && found == 0) {
+        // One-line diagnostic so operators on WSL2 / kernels with broken
+        // NLMSG_DONE handling can correlate "no path-monitor callback
+        // ever fired" with the right root cause. stderr is fine; the
+        // monitor doesn't have a logger handle.
+        fprintf(stderr,
+            "[ttsignal] LinuxNetlinkMonitor: RTM_GETROUTE family=%d "
+            "timed out after 1s (kernel did not send NLMSG_DONE); "
+            "treating as 'no default route yet'. Common on WSL2.\n",
+            family);
+        fflush(stderr);
+    }
     return found;
 }
 
@@ -305,8 +363,16 @@ static void ReaderLoop(Monitor* self)
 
 extern "C" {
 
-TTNetworkMonitorRef tt_netmon_start(TTPathChangeCallback cb, void* userdata)
+TTNetworkMonitorRef tt_netmon_start(const TTNetworkMonitorOptions* options,
+                                    TTPathChangeCallback cb,
+                                    void* userdata)
 {
+    // Linux netlink picks the active default route by destination metric, not
+    // by interface type, and openvpn/wireguard tun devices win or lose that
+    // race the same way physical interfaces do — so the bypassVpn knob has
+    // no straightforward analogue here. Accept the option for ABI parity and
+    // ignore it. Same applies on Windows.
+    (void)options;
     if (!cb) return nullptr;
     Monitor* self = new Monitor();
     self->callback = cb;

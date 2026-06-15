@@ -49,6 +49,29 @@ public class Config {
     // Self-signed root CA certificate in PEM format for custom certificate chain verification
     public String caCertPem = "";
 
+    // -------- Outbound proxy (RFC 9298 CONNECT-UDP / MASQUE) --------
+    // When configured, every connection created from this connector tunnels its
+    // QUIC traffic through a MASQUE proxy instead of dialing the target directly.
+    // proxyUrl is the primary input; proxyHost/proxyPort/proxySni override the
+    // values parsed from it. Leave all empty/0 for a direct connection.
+    // Accepted proxyUrl forms: "masque://host:port", "https://host:port",
+    // "h3://host:port", or a bare "host:port" (defaults to MASQUE). Port
+    // defaults to 443; IPv6 must be bracketed ("[2001:db8::1]:443").
+    public String proxyUrl = "";
+    // Proxy host/IP. Setting it alone (without proxyUrl) enables the MASQUE proxy.
+    public String proxyHost = "";
+    // Proxy port (default 443 when enabled via proxyUrl/proxyHost; 0 = unset).
+    public int proxyPort = 0;
+    // Outer TLS SNI presented to the proxy (defaults to proxyHost).
+    public String proxySni = "";
+    // Self-signed root CA (PEM) used to verify the outer hop to the proxy.
+    // Empty = use the system trust store for the proxy's TLS certificate.
+    public String proxyCaCertPem = "";
+    // Base64 SHA-256 SPKI pin for the proxy's leaf certificate. When set, the
+    // outer CONNECT-UDP hop is pinned to this public key (defense in depth on
+    // top of normal chain verification). Empty = no pinning.
+    public String spkiPin = "";
+
     public Config() {
         // Default constructor
     }

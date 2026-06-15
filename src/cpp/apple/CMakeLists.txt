@@ -13,11 +13,18 @@ cmake_minimum_required(VERSION 3.20)
 
 set(TT_APPLE_MONITOR_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/AppleNetworkMonitor.mm
+    # AppleRouteLookup.cpp is plain C++ (no ObjC), so it is NOT subject
+    # to the -fobjc-arc flag the parent CMakeLists applies to *.mm. It
+    # is bundled into the same source list because every Apple build
+    # that needs the path monitor also needs route lookups, and keeping
+    # them in one variable avoids touching three call sites.
+    ${CMAKE_CURRENT_SOURCE_DIR}/AppleRouteLookup.cpp
 )
 
 set(TT_APPLE_MONITOR_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/AppleNetworkMonitor.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../INetworkPathMonitor.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../NetworkRouteLookup.h
 )
 
 set(TT_IOS_BRIDGE_SRC

@@ -81,7 +81,16 @@ include_directories(
         ${BASE_DIR}/../../../../../src/cpp
 )
 
+# CONFIGURE_DEPENDS makes CMake recheck this glob on every build and
+# trigger a reconfigure when files appear/disappear. Without it,
+# scripts/build-so.sh only reconfigures when CMakeLists.txt itself is
+# newer than Makefile, so dropping a new .cpp into src/cpp/ would
+# silently miss the JNI build and produce an undefined-symbol link
+# error (this is exactly how NetworkRouteLookup.cpp was missed when
+# tt_route_lookup_ifindex was added). Requires CMake >= 3.12; the
+# project minimum is 3.22.1 so this is safe.
 file(GLOB JNI_SRC_FILES
+        CONFIGURE_DEPENDS
         ${BASE_DIR}/../../../../../src/cpp/*.cpp
         ${BASE_DIR}/../../../../../src/cpp/http-parser/http_parser.c
         ${BASE_DIR}/../../../../../src/cpp/jni/*.cpp

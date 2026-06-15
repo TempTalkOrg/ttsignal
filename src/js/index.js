@@ -1009,10 +1009,30 @@ ttsignal.ServerConnection.prototype.close = function(){
  *   so application code does NOT need to call `connection.restart()`
  *   manually. Set `disableAutoRestart: true` for long-lived server
  *   deployments where the box never roams.
+ * @param config.proxyUrl {String=} optional MASQUE CONNECT-UDP (RFC 9298)
+ *   proxy. When set, every connection created from this connector tunnels its
+ *   QUIC packets to the real server through an HTTP/3 CONNECT-UDP session to
+ *   this proxy (the proxy must speak MASQUE connect-udp). Accepted forms:
+ *   `masque://host:port`, `https://host:port`, `h3://host:port`, or a bare
+ *   `host:port` (defaults to MASQUE). Port defaults to 443; IPv6 must be
+ *   bracketed (`[2001:db8::1]:443`). Alias: `proxy_url`.
+ * @param config.proxyHost {String=} optional, proxy host. Overrides the host
+ *   parsed from `proxyUrl`; setting it alone enables the MASQUE proxy.
+ *   Alias: `proxy_host`.
+ * @param config.proxyPort {Number=} optional, proxy port (default 443).
+ *   Alias: `proxy_port`.
+ * @param config.proxySni {String=} optional, TLS SNI presented to the proxy
+ *   (defaults to the proxy host). Alias: `proxy_sni`.
  * @example
  *     var connector = ttsignal.createConnector({
  *         alpn: 'ttsignal',
  *         disableAutoRestart: false,  // default
+ *     });
+ * @example
+ *     // Route all connections through a MASQUE CONNECT-UDP proxy:
+ *     var connector = ttsignal.createConnector({
+ *         alpn: 'ttsignal',
+ *         proxyUrl: 'masque://proxy.example.com:443',
  *     });
  **/
 ttsignal.createConnector = function(config){
@@ -1024,6 +1044,20 @@ ttsignal.createConnector = function(config){
     }
     if (config.caCertPem && !config.ca_cert_pem) {
         config.ca_cert_pem = config.caCertPem;
+    }
+    // MASQUE CONNECT-UDP proxy config: accept camelCase aliases and forward as
+    // the snake_case keys the native layer reads (proxy_url/host/port/sni).
+    if (config.proxyUrl && !config.proxy_url) {
+        config.proxy_url = config.proxyUrl;
+    }
+    if (config.proxyHost && !config.proxy_host) {
+        config.proxy_host = config.proxyHost;
+    }
+    if (config.proxyPort && !config.proxy_port) {
+        config.proxy_port = config.proxyPort;
+    }
+    if (config.proxySni && !config.proxy_sni) {
+        config.proxy_sni = config.proxySni;
     }
     return ttsignal.__createConnector__(config);
 }

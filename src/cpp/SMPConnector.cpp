@@ -5,6 +5,9 @@
 
 #include "StdAfx.h"
 #include <time.h>
+#include <chrono>
+#include <cctype>
+#include <cstdlib>
 #include <fcntl.h>
 #include <openssl/rand.h>
 #include <openssl/pem.h>
@@ -13,17 +16,48 @@
 #include <openssl/x509_vfy.h>
 #include <openssl/bio.h>
 #include <openssl/err.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
+#include <openssl/base64.h>
 #include <HTTP/HTTPProtocol.h>
 #include "SMPConnector.h"
 #include "Runtime.h"
 #include "BC/BCJson.h"
 #include "Utils.h"
+#include "MasqueFraming.h"
 
 
 #define XQC_PACKET_TMP_BUF_LEN 1500
 #define DEFAULT_CONNECT_TIMEOUT 10000
 
 namespace {
+
+// No-op IConnectionHandler for the internal MASQUE tunnel connection. The
+// tunnel is invisible to the application, so none of these callbacks should
+// surface anywhere; all tunnel state transitions are observed directly by the
+// inner connection through the masque_* hand-offs. A single stateless
+// instance is shared by every tunnel.
+class MasqueTunnelHandler : public IConnectionHandler
+{
+public:
+    void OnHandshakeFinished() override {}
+    void OnExecDone(IRPCStub*) override {}
+    void OnStreamCreated(uint32_t) override {}
+    void OnStreamClosed(uint32_t) override {}
+    void OnStreamDataAcked(uint32_t, xqc_usec_t, size_t, size_t) override {}
+    void OnStreamDataSent(uint32_t, uint32_t, size_t) override {}
+    void OnRecvCmd(const SMPHeader&, const char*, size_t) override {}
+    void OnRecvData(const SMPHeader&, LPCVOID, size_t) override {}
+    void OnRestart(BCRESULT, const char*) override {}
+    void OnClosed(LPCSTR) override {}
+    void OnException(BCException&) override {}
+
+    static MasqueTunnelHandler* Instance()
+    {
+        static MasqueTunnelHandler s_instance;
+        return &s_instance;
+    }
+};
 
 void freeCertVector(std::vector<X509*>& certs)
 {
@@ -119,6 +153,63 @@ int addTrustedCAsToStore(X509_STORE* store, const std::vector<X509*>& certs, LPV
         return -1;
     }
     return 0;
+}
+
+// Canonicalize a base64 SPKI pin for comparison: map url-safe and space-decoded
+// variants back to standard base64 and strip padding/whitespace. Mirrors the
+// Android-side normalizeBase64Pin so a url-safe pin from the share link
+// (init-self-signed.sh: tr '+/' '-_') compares equal to the locally computed one.
+std::string canonicalizeSpkiPin(const char* pin, size_t len)
+{
+    std::string out;
+    out.reserve(len);
+    for (size_t i = 0; i < len; ++i) {
+        char c = pin[i];
+        switch (c) {
+            case '-': out.push_back('+'); break;   // url-safe -> standard
+            case '_': out.push_back('/'); break;   // url-safe -> standard
+            case ' ': out.push_back('+'); break;   // '+' decoded as space in transit
+            case '=':                              // drop padding
+            case '\r':
+            case '\n':
+            case '\t': break;                       // drop whitespace
+            default:  out.push_back(c); break;
+        }
+    }
+    return out;
+}
+
+// SHA-256(SubjectPublicKeyInfo) of the leaf, standard base64 (no padding).
+// Returns empty string on failure.
+std::string computeSpkiPinBase64(X509* leaf)
+{
+    if (!leaf) {
+        return std::string();
+    }
+    EVP_PKEY* pkey = X509_get_pubkey(leaf);
+    if (!pkey) {
+        return std::string();
+    }
+    // i2d_PUBKEY marshals the public key as a DER SubjectPublicKeyInfo — matches
+    // the server's `openssl pkey -pubin -outform der` (init-self-signed.sh).
+    unsigned char* spki_der = NULL;
+    int spki_len = i2d_PUBKEY(pkey, &spki_der);
+    EVP_PKEY_free(pkey);
+    if (spki_len <= 0 || !spki_der) {
+        return std::string();
+    }
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(spki_der, (size_t)spki_len, hash);
+    OPENSSL_free(spki_der);
+
+    // EVP_EncodeBlock writes ceil(n/3)*4 + 1 bytes (incl. NUL) and returns the
+    // number of bytes written excluding the NUL.
+    unsigned char b64[((SHA256_DIGEST_LENGTH + 2) / 3) * 4 + 1];
+    size_t b64_len = EVP_EncodeBlock(b64, hash, SHA256_DIGEST_LENGTH);
+    if (b64_len == 0) {
+        return std::string();
+    }
+    return canonicalizeSpkiPin((const char*)b64, b64_len);
 }
 
 } // namespace
@@ -452,6 +543,75 @@ BCRESULT H3Stream::SendRequest()
     return BC_R_SUCCESS;
 }
 
+BCRESULT H3Stream::SendConnectUdpRequest(
+    const std::string& authority,
+    const std::string& target_host,
+    uint16_t target_port)
+{
+    // RFC 9298 §3: Extended CONNECT with :protocol=connect-udp and the URI
+    // template /.well-known/masque/udp/{target_host}/{target_port}/. The
+    // capsule-protocol header advertises capsule support (we tolerate but do
+    // not emit capsules for the base context-0 UDP flow).
+    KBPool pool;
+    std::vector<xqc_http_header_t> headers;
+    std::string path = masque::BuildConnectUdpPath(target_host, target_port);
+
+    xqc_http_header_t method = {
+        .name = {.iov_base = (char*)":method", .iov_len = 7 },
+        .value = {.iov_base = (char*)"CONNECT", .iov_len = 7 },
+        .flags = 0,
+    };
+    headers.push_back(method);
+    xqc_http_header_t protocol = {
+        .name = {.iov_base = (char*)":protocol", .iov_len = 9 },
+        .value = {.iov_base = (char*)"connect-udp", .iov_len = 11 },
+        .flags = 0,
+    };
+    headers.push_back(protocol);
+    xqc_http_header_t scheme = {
+        .name = {.iov_base = (char*)":scheme", .iov_len = 7 },
+        .value = {.iov_base = (char*)"https", .iov_len = 5 },
+        .flags = 0,
+    };
+    headers.push_back(scheme);
+    xqc_http_header_t authority_hdr = {
+        .name = {.iov_base = (char*)":authority", .iov_len = 10 },
+        .value = {.iov_base = (char*)pool.Strdup(authority.c_str()), .iov_len = authority.length() },
+        .flags = 0,
+    };
+    headers.push_back(authority_hdr);
+    xqc_http_header_t path_hdr = {
+        .name = {.iov_base = (char*)":path", .iov_len = 5 },
+        .value = {.iov_base = (char*)pool.Strdup(path.c_str()), .iov_len = path.length() },
+        .flags = 0,
+    };
+    headers.push_back(path_hdr);
+    xqc_http_header_t capsule = {
+        .name = {.iov_base = (char*)"capsule-protocol", .iov_len = 16 },
+        .value = {.iov_base = (char*)"?1", .iov_len = 2 },
+        .flags = 0,
+    };
+    headers.push_back(capsule);
+
+    h3_hdrs_.headers = headers.data();
+    h3_hdrs_.count = headers.size();
+    if (start_time_ == 0) {
+        start_time_ = xqc_now();
+    }
+    // fin=0: the request stream stays open for the lifetime of the tunnel.
+    int ret = xqc_h3_request_send_headers(stream_, &h3_hdrs_, 0);
+    if (ret < 0) {
+        LogQ(conn_->connector_->logger_ctx_, _ERROR_,
+             "[masque] CONNECT-UDP send_headers error %d", ret);
+        return BC_R_FAILURE;
+    }
+    hdr_sent_ = 1;
+    LogQ(conn_->connector_->logger_ctx_, _INFO_,
+         "[masque] CONNECT-UDP sent: authority=%s path=%s",
+         authority.c_str(), path.c_str());
+    return BC_R_SUCCESS;
+}
+
 int H3Stream::Send(const void *data, size_t size)
 {
     // ssize_t ret = 0;
@@ -607,9 +767,18 @@ SMPConnection::Config::Config()
     , linger_on(false), ping_interval(0), active_connection_id_limit(0)
     , alpn(NULL), device_type(0)
     , ca_cert_pem(NULL), ca_cert_pem_len(0)
+    , proxy_type(TT_PROXY_NONE), proxy_host(NULL), proxy_port(0)
+    , proxy_sni(NULL), proxy_url(NULL)
+    , proxy_ca_cert_pem(NULL), proxy_ca_cert_pem_len(0)
+    , spki_pin(NULL), spki_pin_len(0)
 {
     RAND_bytes((uint8_t*)cid_tag, SMP_CID_TAG_LEN);
 }
+
+// Forward declaration: ParseProxyUrl is a file-local static defined later in
+// this translation unit (alongside SMPConnector::Config::Init).
+static bool ParseProxyUrl(const char* url, TTProxyType* type_out,
+                          std::string* host_out, uint16_t* port_out);
 
 BCRESULT SMPConnection::Config::Init(BCFObject* pConfig)
 {
@@ -706,6 +875,58 @@ BCRESULT SMPConnection::Config::Init(BCFObject* pConfig)
         ca_cert_pem = pool_.Strdup(GET_BCF_STRING(pVar));
         ca_cert_pem_len = strlen(ca_cert_pem);
     }
+    // Outbound proxy (RFC 9298 CONNECT-UDP / MASQUE). Primary input is the
+    // "proxy_url" key; explicit proxy_host / proxy_port / proxy_sni override
+    // the parsed values for callers that prefer split fields.
+    pVar = pConfig->Get("proxy_url");
+    if (IS_BCF_STRING(pVar))
+    {
+        proxy_url = pool_.Strdup(GET_BCF_STRING(pVar));
+        std::string parsed_host;
+        uint16_t parsed_port = 0;
+        TTProxyType parsed_type = TT_PROXY_NONE;
+        if (proxy_url && *proxy_url
+            && ParseProxyUrl(proxy_url, &parsed_type, &parsed_host, &parsed_port))
+        {
+            proxy_type = parsed_type;
+            proxy_host = pool_.Strdup(parsed_host.c_str());
+            proxy_port = parsed_port;
+        }
+    }
+    pVar = pConfig->Get("proxy_host");
+    if (IS_BCF_STRING(pVar))
+    {
+        proxy_host = pool_.Strdup(GET_BCF_STRING(pVar));
+        if (proxy_type == TT_PROXY_NONE)
+        {
+            proxy_type = TT_PROXY_MASQUE;
+        }
+    }
+    pVar = pConfig->Get("proxy_port");
+    if (IS_BCF_NUMBER(pVar))
+    {
+        proxy_port = (uint16_t)GET_BCF_INT(pVar);
+    }
+    pVar = pConfig->Get("proxy_sni");
+    if (IS_BCF_STRING(pVar))
+    {
+        proxy_sni = pool_.Strdup(GET_BCF_STRING(pVar));
+    }
+    // Default outer TLS SNI to the proxy host when not explicitly supplied.
+    if (proxy_type != TT_PROXY_NONE && (!proxy_sni || !*proxy_sni) && proxy_host)
+    {
+        proxy_sni = pool_.Strdup(proxy_host);
+    }
+    pVar = pConfig->Get("proxy_ca_cert_pem");
+    if (IS_BCF_STRING(pVar)) {
+        proxy_ca_cert_pem = pool_.Strdup(GET_BCF_STRING(pVar));
+        proxy_ca_cert_pem_len = strlen(proxy_ca_cert_pem);
+    }
+    pVar = pConfig->Get("spki_pin");
+    if (IS_BCF_STRING(pVar)) {
+        spki_pin = pool_.Strdup(GET_BCF_STRING(pVar));
+        spki_pin_len = strlen(spki_pin);
+    }
     return BC_R_SUCCESS;
 }
 
@@ -745,12 +966,12 @@ BCRESULT SMPConnection::Create(
     SMPConnector* connector, 
     IConnectionHandler *pHandler, 
     BCFObject* pConfig,
-    uint64_t id)
+    uint64_t id,
+    BCTaskMgr* pTaskMgr,
+    BCTimerMgr* pTimerMgr)
 {
     BCRESULT result;
     BCSockAddrS localAddr;
-    BCTaskMgr* pTaskMgr;
-    BCTimerMgr* pTimerMgr;
 
     if (!connector || !pHandler || !pConfig)
     {
@@ -762,8 +983,12 @@ BCRESULT SMPConnection::Create(
         LogQ(connector->logger_ctx_, _ERROR_, "invalid arguments: invalid alpn or server_host");
         return BC_R_INVALIDARG;
     }
-    pTaskMgr = Runtime::RandomTaskMgr();
-    pTimerMgr = Runtime::RandomTimerMgr();
+    // Co-locate on caller-provided managers when given (MASQUE tunnel pins to
+    // its inner connection's thread); otherwise pick random managers.
+    if (!pTaskMgr)  pTaskMgr  = Runtime::RandomTaskMgr();
+    if (!pTimerMgr) pTimerMgr = Runtime::RandomTimerMgr();
+    task_mgr_  = pTaskMgr;
+    timer_mgr_ = pTimerMgr;
     udp_socket_ = new UDPSenderGroup();
     if (!udp_socket_)
     {
@@ -900,6 +1125,20 @@ BCRESULT SMPConnection::SendPacket(SMPacketPtr pkt)
 
 void SMPConnection::Restart(int64_t networkHandle)
 {
+    // Public API hit by:
+    //   - SMPConnector::OnPathChange (internal auto-restart on OS path
+    //     change; that entry point applies its own cooldown so a single
+    //     Wi-Fi handover doesn't fan out into multiple restarts here)
+    //   - tt_connection_restart from the JNI / Swift / NAPI bridge when
+    //     the application has set disableAutoRestart=true and is driving
+    //     migration itself
+    //
+    // We do NOT impose any cooldown here: if the caller asked for a
+    // restart, they get a restart. Coalescing has to live at the source
+    // of the noise (OnPathChange), otherwise a legitimate
+    // application-driven restart (e.g. livekit-swift-sdk's
+    // SignalClient.restartTransport on cellular handover) gets silently
+    // dropped and the connection idle-timeouts.
     if (keep_working_)
     {
         PostTask([this, networkHandle] {
@@ -954,6 +1193,26 @@ BCRESULT SMPConnection::Connect_Internal()
     BCRESULT result;
     xqc_cong_ctrl_callback_t cong_ctrl;
     uint32_t cong_flags = 0;
+
+    // MASQUE proxy gate: a fresh app-facing connection (role still NONE) on a
+    // proxy-configured connector must first stand up the outer CONNECT-UDP
+    // tunnel. Once the tunnel is ready, MasqueOnTunnelReady() re-enters this
+    // function with masque_role_ == MASQUE_INNER to perform the real
+    // jqc_connect over the tunnel. The tunnel connection itself has role
+    // MASQUE_TUNNEL and falls straight through to a normal direct connect.
+    if (masque_role_ == MASQUE_NONE
+        && config_.proxy_type == TT_PROXY_MASQUE)
+    {
+        masque_role_ = MASQUE_INNER;
+        masque_target_host_ = host_;
+        masque_target_port_ = port_;
+        LogQ(connector_->logger_ctx_, _INFO_,
+             "[masque] inner connect deferred; bringing up tunnel to %s:%u for target %s:%u",
+             config_.proxy_host ? config_.proxy_host : "?",
+             (unsigned)config_.proxy_port,
+             masque_target_host_.c_str(), (unsigned)masque_target_port_);
+        return MasqueStartTunnel();
+    }
     if (config_.c_cong_ctl == 'b') {
         cong_ctrl = xqc_bbr_cb;
         cong_flags = XQC_BBR_FLAG_NONE;
@@ -1009,7 +1268,12 @@ BCRESULT SMPConnection::Connect_Internal()
 
     xqc_conn_ssl_config_t conn_ssl_config;
     memset(&conn_ssl_config, 0, sizeof(conn_ssl_config));
-    if (!root_cas_.empty() || !connector_->root_cas_.empty()) {
+    // Enable the verify callback when EITHER a CA bundle (inner CA-chain path)
+    // OR an SPKI pin (outer self-signed proxy hop) is configured. Without this,
+    // a pin-only connection would skip the callback and connect unverified.
+    if (!root_cas_.empty() || !connector_->root_cas_.empty()
+        || (config_.spki_pin && config_.spki_pin_len > 0
+            && !(config_.proxy_host && config_.proxy_host[0] != '\0'))) {
         conn_ssl_config.cert_verify_flag = XQC_TLS_CERT_FLAG_NEED_VERIFY
                                          | XQC_TLS_CERT_FLAG_ALLOW_SELF_SIGNED;
     }
@@ -1030,7 +1294,44 @@ BCRESULT SMPConnection::Connect_Internal()
         webtransport_ = true;
     }
 
-    if (udp_socket_)
+    // MASQUE tunnel: the inner QUIC client must put a >=1200B padded Initial
+    // (RFC 9000 anti-amplification; the real xquic server also rejects smaller
+    // Initials) into a single outer HTTP/3 datagram, which must in turn fit in
+    // one outer QUIC packet. The default 1200B outer MTU only yields a ~1184B
+    // datagram MSS, too small for the 1200B inner Initial. Raise the outer MTU
+    // to xquic's ceiling (XQC_QUIC_MAX_MSS = 1420) so the datagram MSS (~1404)
+    // can carry the inner Initial. Safe on standard >=1420B paths.
+    if (masque_role_ == MASQUE_TUNNEL)
+    {
+        conn_settings.max_pkt_out_size = 1420;
+    }
+
+    // Inner MASQUE connections have no real UDP path of their own; their
+    // packets ride the tunnel as HTTP/3 datagrams. Skip the local socket
+    // recv and shrink the inner MTU so a wrapped datagram fits the tunnel's
+    // datagram MSS (and disable PMTUD, which can't probe a tunnelled path).
+    if (masque_role_ == MASQUE_INNER)
+    {
+        size_t inner_mss = masque_tunnel_ ? masque_tunnel_->MasqueDatagramMss() : 0;
+        if (inner_mss == 0)
+        {
+            LogQ(connector_->logger_ctx_, _ERROR_,
+                 "[masque] tunnel datagram MSS unavailable; cannot connect inner");
+            return BC_R_FAILURE;
+        }
+        conn_settings.enable_pmtud = 0;
+        conn_settings.max_pkt_out_size = inner_mss;
+        // Synthesize a stable local address for xquic path bookkeeping; the
+        // inner connection never migrates so any consistent pair works.
+        memset(&local_addr_, 0, sizeof(local_addr_));
+        local_addrlen_ = connector_->config_.ipv6 ? sizeof(struct sockaddr_in6)
+                                                   : sizeof(struct sockaddr_in);
+        ((struct sockaddr*)&local_addr_)->sa_family =
+            connector_->config_.ipv6 ? AF_INET6 : AF_INET;
+        LogQ(connector_->logger_ctx_, _INFO_,
+             "[masque] inner connect over tunnel, max_pkt_out_size=%zu", inner_mss);
+    }
+    else if (udp_socket_)
     {
         udp_socket_->StartRecv();
     }
@@ -1258,6 +1559,14 @@ int SMPConnection::OnH3ConnCreate(
     };
     xqc_h3_conn_set_settings(h3_conn, &settings);
 
+    // For the MASQUE tunnel, datagrams carry the inner connection's packets;
+    // bind the h3 datagram callbacks' user_data to this tunnel so
+    // on_h3_ext_datagram_read can route by quarter-stream-id.
+    if (masque_role_ == MASQUE_TUNNEL)
+    {
+        xqc_h3_ext_datagram_set_user_data(h3_conn, this);
+    }
+
     return 0;
 }
 
@@ -1265,6 +1574,19 @@ void SMPConnection::OnH3HandshakeFinished()
 {
     connector_->active_connections++;
     state_ = CONN_STATE_CONNECTING;
+
+    // MASQUE tunnel: the outer h3 handshake is up; open the CONNECT-UDP
+    // request for the inner target instead of a WebTransport session. The
+    // inner connection is notified once the proxy answers with a 2xx.
+    if (masque_role_ == MASQUE_TUNNEL)
+    {
+        if (MasqueSendConnectUdp() != BC_R_SUCCESS)
+        {
+            MasqueOnConnectUdpResponse(false);
+        }
+        return;
+    }
+
     if (handler_)
     {
         handler_->OnHandshakeFinished();
@@ -1374,7 +1696,22 @@ SMPConnection::WritePacket(
     BCRESULT result;
 
     // MUST NOT do close check here, because it will stop the connection from sending close frame
-    if (state_ <= CONN_STATE_CLOSING_SOCK || udp_socket_ == NULL)
+    if (state_ <= CONN_STATE_CLOSING_SOCK)
+    {
+        return -1;
+    }
+    // Inner MASQUE connection: ferry the QUIC packet to the proxy as an HTTP/3
+    // datagram via the tunnel instead of writing a real socket. peer_addr is
+    // ignored here (the proxy already knows the CONNECT-UDP target).
+    if (masque_role_ == MASQUE_INNER)
+    {
+        if (!masque_tunnel_)
+        {
+            return XQC_SOCKET_EAGAIN;
+        }
+        return masque_tunnel_->MasqueSendDatagram(buf, size);
+    }
+    if (udp_socket_ == NULL)
     {
         return -1;
     }
@@ -1407,6 +1744,36 @@ SMPConnection::WritePacket(
 
 void SMPConnection::OnH3RequestRecvHeaders(xqc_http_headers_t* headers)
 {
+    // MASQUE tunnel: the CONNECT-UDP response carries the tunnel verdict in
+    // :status. 2xx means the UDP proxying flow is established; anything else
+    // (or missing headers) is a failure. We do not surface anything to an app
+    // handler here — the inner connection is the observer.
+    if (masque_role_ == MASQUE_TUNNEL)
+    {
+        bool ok = false;
+        if (headers)
+        {
+            for (size_t i = 0; i < headers->count; i++)
+            {
+                const char* name = (const char*)headers->headers[i].name.iov_base;
+                size_t name_len = headers->headers[i].name.iov_len;
+                if (name_len == 7 && memcmp(name, ":status", 7) == 0)
+                {
+                    const char* val = (const char*)headers->headers[i].value.iov_base;
+                    if (headers->headers[i].value.iov_len >= 1 && val[0] == '2')
+                    {
+                        ok = true;
+                    }
+                    break;
+                }
+            }
+        }
+        LogQ(connector_->logger_ctx_, _INFO_,
+             "[masque] CONNECT-UDP response: %s", ok ? "established (2xx)" : "rejected");
+        MasqueOnConnectUdpResponse(ok);
+        return;
+    }
+
     Json::Value props(Json::objectValue);
     if (headers) {
         for (size_t i = 0; i < headers->count; i++) {
@@ -1444,6 +1811,244 @@ void SMPConnection::OnH3RequestRecvHeaders(xqc_http_headers_t* headers)
     }
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// MASQUE CONNECT-UDP helpers (SMPConnection)
+//
+// Threading: each method documents whether it runs on the INNER or TUNNEL
+// connection's event queue. Cross-connection hand-offs always go through the
+// peer's PostTask so we never re-enter the shared xquic engine synchronously.
+///////////////////////////////////////////////////////////////////////////////
+
+BCRESULT SMPConnection::MasqueStartTunnel()
+{
+    // INNER queue. Create the outer tunnel and kick its connect to the proxy.
+    masque_tunnel_ = connector_->CreateMasqueTunnel(this);
+    if (!masque_tunnel_)
+    {
+        _NotifyConnectResult(NULL, BC_R_FAILURE, "masque: failed to create tunnel", 0);
+        return BC_R_FAILURE;
+    }
+    masque_tunnel_->MasqueConnectToProxy();
+    return BC_R_SUCCESS;
+}
+
+void SMPConnection::MasqueConnectToProxy()
+{
+    // TUNNEL role. Drive the outer h3 connect on our own queue.
+    if (!keep_working_)
+    {
+        return;
+    }
+    PostTask([this] {
+        if (_CloseCheck())
+        {
+            return;
+        }
+        if (state_ > CONN_STATE_INIT)
+        {
+            return;
+        }
+        scheme_ = "https";
+        host_   = (masque_inner_ && masque_inner_->config_.proxy_host) ? masque_inner_->config_.proxy_host : "";
+        port_   = masque_inner_ ? masque_inner_->config_.proxy_port : 0;
+        state_  = CONN_STATE_HANDSHAKE;
+        BCRESULT result = Connect_Internal();
+        if (result != BC_R_SUCCESS)
+        {
+            MasqueOnConnectUdpResponse(false);
+        }
+        _CloseCheck();
+    });
+}
+
+size_t SMPConnection::MasqueDatagramMss()
+{
+    // TUNNEL role. Max inner UDP payload = outer datagram MSS minus our
+    // RFC 9297/9298 header (quarter-stream-id + context-id varints).
+    if (masque_role_ != MASQUE_TUNNEL || !h3_conn_)
+    {
+        return 0;
+    }
+    size_t mss = xqc_h3_ext_datagram_get_mss(h3_conn_);
+    size_t overhead = masque::DatagramOverhead(masque_qsid_);
+    // Safety margin: get_mss reflects the outer datagram capacity at query time,
+    // but the real per-packet headroom shrinks afterwards (longer packet numbers,
+    // coalesced ACK frames). Sizing the inner MTU at exactly (mss - overhead)
+    // leaves zero slack, so steady-state full 1RTT packets overflow the outer
+    // datagram and xqc_h3_ext_datagram_send returns -681 (XQC_EDGRAM_TOO_LARGE)
+    // on every packet. Reserve a margin so wrapped inner packets always fit. With
+    // the standard 1420B outer MTU the inner still stays >=1200B for the padded
+    // Initial.
+    const size_t kMasqueMssSafetyMargin = 64;
+    if (mss <= overhead + kMasqueMssSafetyMargin)
+    {
+        return 0;
+    }
+    return mss - overhead - kMasqueMssSafetyMargin;
+}
+
+BCRESULT SMPConnection::MasqueSendConnectUdp()
+{
+    // TUNNEL role. Open the CONNECT-UDP request and remember its quarter
+    // stream id for datagram framing.
+    H3Stream* st = new H3Stream();
+    if (!st)
+    {
+        return BC_R_NOMEMORY;
+    }
+    xqc_stream_settings_t settings = { .recv_rate_bytes_per_sec = 0 };
+    xqc_h3_request_t* stream = xqc_h3_request_create(connector_->engine_, &cid_, &settings, st);
+    if (!stream)
+    {
+        delete st;
+        return BC_R_FAILURE;
+    }
+    xqc_stream_id_t id = xqc_h3_request_id(stream);
+    if (st->Create(id, stream, this) != BC_R_SUCCESS)
+    {
+        xqc_h3_request_close(stream);
+        return BC_R_FAILURE;
+    }
+    h3_stream_map_[id] = st;
+    masque_connect_stream_ = st;
+    masque_qsid_ = masque::QuarterStreamId(id);
+
+    std::string authority = host_ + ":" + std::to_string((unsigned)port_);
+    return st->SendConnectUdpRequest(authority, masque_target_host_, masque_target_port_);
+}
+
+void SMPConnection::MasqueOnConnectUdpResponse(bool ok)
+{
+    // TUNNEL role. Tell the inner connection (on its queue) the verdict.
+    if (masque_tunnel_ready_ && ok)
+    {
+        return; // ignore duplicate header notifications
+    }
+    if (ok)
+    {
+        masque_tunnel_ready_ = true;
+    }
+    SMPConnection* inner = masque_inner_;
+    BCRESULT result = ok ? BC_R_SUCCESS : BC_R_FAILURE;
+    if (inner)
+    {
+        inner->PostTask([inner, result] {
+            inner->MasqueOnTunnelReady(result);
+        });
+    }
+}
+
+void SMPConnection::MasqueOnTunnelReady(BCRESULT result)
+{
+    // INNER queue. Tunnel is up (or failed); perform/abandon the real connect.
+    if (_CloseCheck())
+    {
+        return;
+    }
+    if (result != BC_R_SUCCESS)
+    {
+        LogQ(connector_->logger_ctx_, _ERROR_, "[masque] tunnel failed; failing inner connect");
+        _NotifyConnectResult(NULL, BC_R_FAILURE, "masque: tunnel establishment failed", 0);
+        _set_state(this, CONN_STATE_FREED, BC_R_FAILURE);
+        _CloseCheck();
+        return;
+    }
+    BCRESULT r = Connect_Internal();
+    if (r != BC_R_SUCCESS)
+    {
+        _NotifyConnectResult(NULL, r, "masque: inner connect failed", 0);
+        _set_state(this, CONN_STATE_FREED, r);
+    }
+    _CloseCheck();
+}
+
+ssize_t SMPConnection::MasqueSendDatagram(const unsigned char* buf, size_t size)
+{
+    // TUNNEL role, but invoked synchronously from the INNER connection's
+    // WritePacket. Encode now, then defer the actual h3 datagram send onto our
+    // own queue to avoid re-entering the shared engine. We report the bytes as
+    // sent; loss is recovered by the inner QUIC connection itself.
+    if (!keep_working_ || masque_role_ != MASQUE_TUNNEL)
+    {
+        return XQC_SOCKET_EAGAIN;
+    }
+    std::vector<uint8_t> wire;
+    if (!masque::EncodeDatagram(masque_qsid_, buf, size, wire))
+    {
+        return XQC_SOCKET_ERROR;
+    }
+    PostTask([this, wire = std::move(wire)]() mutable {
+        if (_CloseCheck())
+        {
+            return;
+        }
+        if (h3_conn_)
+        {
+            uint64_t dgram_id = 0;
+            xqc_int_t ret = xqc_h3_ext_datagram_send(
+                h3_conn_, wire.data(), wire.size(), &dgram_id, XQC_DATA_QOS_HIGH);
+            if (ret < 0 && ret != -XQC_EAGAIN)
+            {
+                LogQ(connector_->logger_ctx_, _WARN_, "[masque] datagram_send err %d", (int)ret);
+            }
+        }
+        _CloseCheck();
+    });
+    return (ssize_t)size;
+}
+
+void SMPConnection::MasqueOnDatagram(const uint8_t* data, size_t len)
+{
+    // TUNNEL queue. Decode RFC 9297/9298 framing and route the inner packet.
+    uint64_t qsid = 0, ctx = 0;
+    const uint8_t* payload = nullptr;
+    size_t payload_len = 0;
+    if (!masque::DecodeDatagram(data, len, &qsid, &ctx, &payload, &payload_len))
+    {
+        return;
+    }
+    if (qsid != masque_qsid_ || ctx != masque::kUdpContextId || payload_len == 0)
+    {
+        return;
+    }
+    SMPConnection* inner = masque_inner_;
+    if (!inner)
+    {
+        return;
+    }
+    std::vector<uint8_t> pkt(payload, payload + payload_len);
+    inner->PostTask([inner, pkt = std::move(pkt)]() mutable {
+        inner->MasqueOnTunneledPacket(pkt.data(), pkt.size());
+    });
+}
+
+void SMPConnection::MasqueOnTunneledPacket(const uint8_t* data, size_t len)
+{
+    // INNER queue. Feed the tunnelled packet into the inner QUIC engine.
+    if (_CloseCheck())
+    {
+        return;
+    }
+    if (!conn_)
+    {
+        return;
+    }
+    uint64_t recv_time = bc_time_now();
+    xqc_int_t ret = jqc_conn_packet_process(
+        conn_, data, len,
+        (struct sockaddr*)&local_addr_, local_addrlen_,
+        (struct sockaddr*)&peer_addr_, peer_addrlen_,
+        XQC_UNKNOWN_PATH_ID, (xqc_msec_t)recv_time, this, NULL, NULL, 0);
+    if (ret != XQC_OK)
+    {
+        LogQ(connector_->logger_ctx_, _ERROR_, "[masque] inner packet process err %d", (int)ret);
+        _CloseCheck();
+        return;
+    }
+    jqc_conn_finish_recv(conn_);
+    _CloseCheck();
+}
+
 void SMPConnection::OnSendData(uint32_t nWrite, UDPSender* pSender)
 {
 
@@ -1454,12 +2059,6 @@ void SMPConnection::OnRecvData(BCBuffer* pBuffer, BCSockAddrS& refSrcAddr)
     if (_CloseCheck())
     {
         return;
-    }
-    if (restart_verify_timer_id_ > 0)
-    {
-        UnscheduleTask(restart_verify_timer_id_);
-        restart_verify_timer_id_ = 0;
-        restart_verify_count_ = 0;
     }
     if (udp_socket_)
     {
@@ -1566,34 +2165,20 @@ void SMPConnection::OnRestart(BCRESULT result)
                 jqc_conn_local_addr_changed(qconn,
                     (struct sockaddr *)&local_addr_, local_addrlen_);
             }
-
-            if (restart_verify_timer_id_ > 0)
-            {
-                UnscheduleTask(restart_verify_timer_id_);
-                restart_verify_timer_id_ = 0;
-            }
-            restart_verify_count_++;
-            ScheduleTask(restart_verify_timer_id_, [this](int32_t timer_id) {
-                if (_CloseCheck())
-                {
-                    return;
-                }
-                UnscheduleTask(restart_verify_timer_id_);
-                restart_verify_timer_id_ = 0;
-                if (restart_verify_count_ < 3 && udp_socket_)
-                {
-                    LogQ(connector_->logger_ctx_, _INFO_,
-                        "restart verify timeout, retry %u", restart_verify_count_);
-                    udp_socket_->Restart(network_handle_);
-                }
-                else
-                {
-                    LogQ(connector_->logger_ctx_, _INFO_,
-                        "restart verify timeout, gave up after %u retries", restart_verify_count_);
-                    restart_verify_count_ = 0;
-                }
-                _CloseCheck();
-            }, 3000000, false);
+            // Note: we deliberately do NOT schedule a "if no data in 3s,
+            // re-Restart" verify timer here. It used to live in this spot
+            // and was the source of a real bug — one upper-layer Restart()
+            // call would fan out into up to 3 OnRestart callbacks (initial
+            // + 2 retries), and each retry was a destructive
+            // udp_socket_->Restart() that rebuilt the socket and forced a
+            // brand-new PATH_CHALLENGE, tearing down a still-validating
+            // migration. xqc handles PATH_CHALLENGE retransmission itself
+            // (PING + idle timeout will surface a genuinely dead path),
+            // and any upper-layer monitor (Java NetworkCallback, iOS/macOS
+            // NWPathMonitor) will drive a fresh Restart on the next real
+            // network event. If we ever do need an actual re-send of
+            // PATH_CHALLENGE without rebuilding the socket, that belongs
+            // in a separate jqc API, not here.
 
             if (handler_)
             {
@@ -1628,6 +2213,24 @@ void SMPConnection::OnUdpClosed()
 
 void SMPConnection::OnEventProcShutdown()
 {
+    if (masque_role_ == MASQUE_TUNNEL)
+    {
+        // Internal tunnel: invisible to the app and absent from conns_map_.
+        // Hand ourselves back to the owning inner connection for deletion. We
+        // post onto the inner's queue (same task manager, but a different call
+        // stack than this shutdown callback) so the inner deletes us only
+        // after this shutdown has fully unwound.
+        SMPConnection* inner = masque_inner_;
+        masque_inner_ = NULL;
+        if (inner)
+        {
+            inner->PostTask([inner] { inner->MasqueOnTunnelClosed(); });
+        }
+        return;
+    }
+    // INNER reaches here only after its owned tunnel has been fully torn down
+    // by the _CloseCheck tunnel-wait stage (masque_tunnel_ == NULL), so no
+    // tunnel task can reference us after the app deletes us.
     if (connector_)
     {
         connector_->NotifyConnClosed(id_);
@@ -1752,12 +2355,6 @@ bool SMPConnection::_CloseCheck()
             UnscheduleTask(connect_timer_id_);
             connect_timer_id_ = 0;
         }
-        if (restart_verify_timer_id_ > 0)
-        {
-            UnscheduleTask(restart_verify_timer_id_);
-            restart_verify_timer_id_ = 0;
-            restart_verify_count_ = 0;
-        }
         state_ = CONN_STATE_CLOSING_QUIC;
     }
 
@@ -1782,12 +2379,56 @@ bool SMPConnection::_CloseCheck()
         {
             return true;
         }
+        // MASQUE inner: ensure the owned tunnel is fully torn down before we
+        // self-destruct. We request its close once and then wait; the tunnel's
+        // shutdown posts MasqueOnTunnelClosed back to us, which deletes it and
+        // re-enters _CloseCheck to finish our own teardown.
+        if (masque_role_ == MASQUE_INNER && masque_tunnel_)
+        {
+            if (!masque_tunnel_closing_)
+            {
+                masque_tunnel_closing_ = true;
+                masque_tunnel_->Close();
+            }
+            return true;
+        }
         _NotifyConnectResult(NULL, close_status_);
         Detach();
         state_ = CONN_STATE_FREED;
     }
 
     return true;
+}
+
+void SMPConnection::MasqueOnTunnelClosed()
+{
+    // INNER queue. The tunnel's event task has fully shut down by now, so it is
+    // safe to delete here (a different call stack than the tunnel's shutdown).
+    SMPConnection* tunnel = masque_tunnel_;
+    masque_tunnel_ = NULL;
+    masque_tunnel_closing_ = false;
+    if (tunnel)
+    {
+        delete tunnel;
+    }
+    if (state_ == CONN_STATE_INIT)
+    {
+        // The tunnel failed before the inner connect could start (still parked
+        // at INIT waiting for the tunnel); fail the connect immediately rather
+        // than waiting for the connect timeout.
+        LogQ(connector_->logger_ctx_, _WARN_, "[masque] tunnel closed before inner connect; failing connect");
+        _NotifyConnectResult(NULL, BC_R_NETDOWN, "masque: tunnel closed before connect", 0);
+        _set_state(this, CONN_STATE_FREED, BC_R_NETDOWN);
+    }
+    else if (state_ > CONN_STATE_INIT)
+    {
+        // The tunnel went away while we were live (e.g. the proxy dropped the
+        // CONNECT-UDP flow); we have no transport left, so tear down.
+        LogQ(connector_->logger_ctx_, _WARN_, "[masque] tunnel closed; tearing down inner connection");
+        _set_state(this, CONN_STATE_FREED, BC_R_NETDOWN);
+    }
+    // state_ < CONN_STATE_INIT: we are already tearing down; just continue.
+    _CloseCheck();
 }
 
 void SMPConnection::_OnConnectTimeout()
@@ -1838,6 +2479,76 @@ void SMPConnection::_NotifyConnectResult(
 ///////////////////////////////////////////////////////////////////////////////
 // class : SMPConnector::Config
 ///////////////////////////////////////////////////////////////////////////////
+
+// Parse a proxy URL of the form "<scheme>://<host>[:<port>]" into its
+// components. Recognised schemes map to TT_PROXY_MASQUE (the only proxy type
+// implemented today): masque, connect-udp, https, h3. Returns false on a
+// syntactically invalid URL. host_out / port_out are only written on success.
+static bool ParseProxyUrl(const char* url,
+                          TTProxyType* type_out,
+                          std::string* host_out,
+                          uint16_t* port_out)
+{
+    if (!url || !*url) {
+        return false;
+    }
+    std::string s(url);
+    std::string scheme;
+    std::string authority;
+    size_t sep = s.find("://");
+    if (sep != std::string::npos) {
+        scheme = s.substr(0, sep);
+        authority = s.substr(sep + 3);
+    } else {
+        // No scheme: assume MASQUE and treat the whole value as authority.
+        authority = s;
+    }
+    // Strip any path/query that follows the authority.
+    size_t slash = authority.find('/');
+    if (slash != std::string::npos) {
+        authority = authority.substr(0, slash);
+    }
+    if (authority.empty()) {
+        return false;
+    }
+
+    // Scheme -> proxy type. Empty scheme defaults to MASQUE.
+    for (char& c : scheme) { c = (char)tolower((unsigned char)c); }
+    if (scheme.empty() || scheme == "masque" || scheme == "connect-udp"
+        || scheme == "https" || scheme == "h3") {
+        *type_out = TT_PROXY_MASQUE;
+    } else {
+        return false;
+    }
+
+    // Split host[:port], honouring [IPv6]:port bracket form.
+    std::string host;
+    uint16_t port = 443;
+    if (authority[0] == '[') {
+        size_t close = authority.find(']');
+        if (close == std::string::npos) {
+            return false;
+        }
+        host = authority.substr(0, close + 1); // keep brackets for the host
+        if (close + 1 < authority.size() && authority[close + 1] == ':') {
+            port = (uint16_t)atoi(authority.c_str() + close + 2);
+        }
+    } else {
+        size_t colon = authority.rfind(':');
+        if (colon != std::string::npos) {
+            host = authority.substr(0, colon);
+            port = (uint16_t)atoi(authority.c_str() + colon + 1);
+        } else {
+            host = authority;
+        }
+    }
+    if (host.empty() || port == 0) {
+        return false;
+    }
+    *host_out = host;
+    *port_out = port;
+    return true;
+}
 
 BCRESULT SMPConnector::Config::Init(BCFObject* pConfig)
 {
@@ -1957,6 +2668,53 @@ BCRESULT SMPConnector::Config::Init(BCFObject* pConfig)
     {
         disableAutoRestart = GET_BCF_BOOL(pVar);
     }
+    pVar = pConfig->Get("bypassVpn");
+    if (IS_BCF_BOOL(pVar))
+    {
+        bypassVpn = GET_BCF_BOOL(pVar);
+    }
+    // Outbound proxy (RFC 9298 CONNECT-UDP / MASQUE). Primary input is the
+    // "proxy_url" key; explicit proxy_host / proxy_port / proxy_sni override
+    // the parsed values for callers that prefer split fields.
+    pVar = pConfig->Get("proxy_url");
+    if (IS_BCF_STRING(pVar))
+    {
+        proxy_url = pool_.Strdup(GET_BCF_STRING(pVar));
+        std::string parsed_host;
+        uint16_t parsed_port = 0;
+        TTProxyType parsed_type = TT_PROXY_NONE;
+        if (proxy_url && *proxy_url
+            && ParseProxyUrl(proxy_url, &parsed_type, &parsed_host, &parsed_port))
+        {
+            proxy_type = parsed_type;
+            proxy_host = pool_.Strdup(parsed_host.c_str());
+            proxy_port = parsed_port;
+        }
+    }
+    pVar = pConfig->Get("proxy_host");
+    if (IS_BCF_STRING(pVar))
+    {
+        proxy_host = pool_.Strdup(GET_BCF_STRING(pVar));
+        if (proxy_type == TT_PROXY_NONE)
+        {
+            proxy_type = TT_PROXY_MASQUE;
+        }
+    }
+    pVar = pConfig->Get("proxy_port");
+    if (IS_BCF_NUMBER(pVar))
+    {
+        proxy_port = (uint16_t)GET_BCF_INT(pVar);
+    }
+    pVar = pConfig->Get("proxy_sni");
+    if (IS_BCF_STRING(pVar))
+    {
+        proxy_sni = pool_.Strdup(GET_BCF_STRING(pVar));
+    }
+    // Default outer TLS SNI to the proxy host when not explicitly supplied.
+    if (proxy_type != TT_PROXY_NONE && (!proxy_sni || !*proxy_sni) && proxy_host)
+    {
+        proxy_sni = pool_.Strdup(proxy_host);
+    }
     return BC_R_SUCCESS;
 }
 
@@ -1997,6 +2755,19 @@ SMPConnector::~SMPConnector()
 }
 
 #if defined(TT_HAS_PATH_MONITOR)
+// Diagnostic-only: forwards every raw NWPathMonitor / netlink / Windows
+// IP-change wakeup to LogQ before any debounce / dedup / VPN-filter is
+// applied. Lets us audit "OS reported N raw path events, SDK reacted to
+// M of them" from a single log file. Hot-but-not-pathological path: at
+// most a few events per second during a Wi-Fi handover.
+void SMPConnector::OnPathRawLog(void* userdata, const char* line)
+{
+    SMPConnector* self = static_cast<SMPConnector*>(userdata);
+    if (!self || !line) return;
+    LogQ(self->logger_ctx_, _INFO_,
+         "[SMPConnector] netmon raw %s", line);
+}
+
 void SMPConnector::OnPathChange(void* userdata, int64_t newIfIndex,
                                 const char* pathDesc)
 {
@@ -2020,6 +2791,36 @@ void SMPConnector::OnPathChange(void* userdata, int64_t newIfIndex,
              (long long)newIfIndex, pathDesc ? pathDesc : "");
         return;
     }
+
+    // Path-monitor side cooldown: a single user-visible Wi-Fi handover
+    // often reaches us as TWO satisfied callbacks several seconds apart
+    // (satisfied-old → unsatisfied → satisfied-new), each debounced
+    // independently. Letting both restarts through tears down a QUIC
+    // path the server may have just finished validating on the first
+    // restart's new socket, and on TUN-mode-VPN hosts (Clash / Surge)
+    // the peer's fake-IP NAT table never recovers from the second
+    // migration. 3000 ms safely covers a normal handover while still
+    // letting a legitimately distinct event (Wi-Fi → cellular → Wi-Fi)
+    // come through on the next decision boundary.
+    //
+    // IMPORTANT: this cooldown is scoped to the auto-restart entry
+    // point. SMPConnection::Restart itself never coalesces, so apps
+    // that set disableAutoRestart=true (and therefore never reach
+    // OnPathChange) keep full control over their restart cadence.
+    constexpr int64_t kPathChangeCooldownMs = 3000;
+    int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (self->last_path_change_ms_ != 0 &&
+        (now_ms - self->last_path_change_ms_) < kPathChangeCooldownMs)
+    {
+        LogQ(self->logger_ctx_, _INFO_,
+             "[SMPConnector] path change ifIndex=%lld desc=\"%s\" "
+             "ignored (cooldown %lldms since last)",
+             (long long)newIfIndex, pathDesc ? pathDesc : "",
+             (long long)(now_ms - self->last_path_change_ms_));
+        return;
+    }
+    self->last_path_change_ms_ = now_ms;
 
     // Snapshot connection list under the lock, then defer the actual
     // SMPConnection::Restart calls onto the runtime thread so the monitor
@@ -2158,6 +2959,11 @@ BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
     }
     /* fixed 16-byte CID */
     config.cid_len = SMP_CID_LEN;
+    /* Enable HTTP/3 extensions so inbound RFC 9297 datagrams are delivered to the
+     * h3 datagram callback. Required for the MASQUE CONNECT-UDP tunnel to receive
+     * the proxy's relayed packets. Only affects h3 connections; the raw "ttsignal"
+     * signaling transport is unaffected. */
+    config.enable_h3_ext = 1;
     quic_lb_ctx_.conf_id = 0;
     quic_lb_ctx_.cid_len = SMP_CID_LEN;
     quic_lb_ctx_.sid_len = 0;
@@ -2185,7 +2991,9 @@ BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
             .h3_request_write_notify = on_h3_stream_write_notify,
             .h3_request_closing_notify = on_h3_stream_closing_notify,
         },
-        .h3_ext_dgram_cbs = {},
+        .h3_ext_dgram_cbs = {
+            .dgram_read_notify = on_h3_ext_datagram_read,
+        },
         .h3_ext_bs_cbs = {},
         .wt_stream_cbs = {
             .stream_read_notify = on_raw_stream_read_notify,
@@ -2237,11 +3045,22 @@ BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
     // callback lands, no spurious mid-handshake Restart goes out.
     if (!config_.disableAutoRestart)
     {
-        path_monitor_ = tt_netmon_start(&SMPConnector::OnPathChange, this);
+        TTNetworkMonitorOptions netmon_opts{};
+        netmon_opts.bypassVpn = config_.bypassVpn ? 1 : 0;
+        netmon_opts.rawLogFn  = &SMPConnector::OnPathRawLog;
+        netmon_opts.rawLogCtx = this;
+        path_monitor_ = tt_netmon_start(&netmon_opts,
+                                        &SMPConnector::OnPathChange, this);
         if (!path_monitor_)
         {
             LogQ(logger_ctx_, _WARN_,
                  "[SMPConnector] tt_netmon_start failed; auto-restart disabled");
+        }
+        else
+        {
+            LogQ(logger_ctx_, _INFO_,
+                 "[SMPConnector] tt_netmon_start ok bypassVpn=%d",
+                 netmon_opts.bypassVpn);
         }
     }
     else
@@ -2280,6 +3099,77 @@ delete_conn:
     delete user_conn;
 
     return NULL;
+}
+
+SMPConnection* SMPConnector::CreateMasqueTunnel(SMPConnection* inner)
+{
+    if (!inner)
+    {
+        return NULL;
+    }
+    if (inner->config_.proxy_type != TT_PROXY_MASQUE
+        || !inner->config_.proxy_host || inner->config_.proxy_port == 0)
+    {
+        LogQ(logger_ctx_, _ERROR_, "[masque] tunnel requested but proxy not configured");
+        return NULL;
+    }
+
+    // Minimal outer-connection config: HTTP/3 ALPN to the proxy, TLS SNI =
+    // proxy_sni (defaults to proxy_host), single UDP sender, inheriting the
+    // connector's IP family / CC / log level. Proxy endpoint and outer-hop TLS
+    // trust come from the inner connection's per-connection proxy config.
+    BCFObject cfg;
+    cfg.PutBool("ipv6", config_.ipv6 ? 1 : 0);
+    cfg.PutString("alpn", "h3");
+    const char* sni = (inner->config_.proxy_sni && *inner->config_.proxy_sni)
+                    ? inner->config_.proxy_sni : inner->config_.proxy_host;
+    cfg.PutString("server_host", sni);
+    cfg.PutInt("server_port", inner->config_.proxy_port);
+    cfg.PutInt("c_cong_ctl", config_.c_cong_ctl ? config_.c_cong_ctl : 'B');
+    cfg.PutInt("log_level", config_.log_level);
+    cfg.PutInt("num_of_senders", 1);
+    // Outer-hop (proxy) TLS trust is separate from the inner SFU CA. Use the
+    // per-connection proxy CA bundle if provided; otherwise leave the tunnel with
+    // NO CA bundle (xquic then accepts the proxy cert — acceptable for a self-signed
+    // Mode-B proxy on a trusted path; supply proxy_ca_cert_pem to enforce verification).
+    if (inner->config_.proxy_ca_cert_pem && inner->config_.proxy_ca_cert_pem_len > 0) {
+        cfg.PutString("ca_cert_pem", inner->config_.proxy_ca_cert_pem);
+    }
+    // Forward the inner's SPKI pin to the TUNNEL connection so the OUTER hop to
+    // the proxy is pinned. The tunnel has no proxy_host (it IS the proxy hop), so
+    // the pin gate (spki_pin set AND proxy_host empty) fires only on the tunnel,
+    // never on the inner (which keeps verifying the SFU via ca_cert_pem).
+    if (inner->config_.spki_pin && inner->config_.spki_pin_len > 0) {
+        cfg.PutString("spki_pin", inner->config_.spki_pin);
+    }
+
+    SMPConnection* tunnel = new SMPConnection();
+    if (!tunnel)
+    {
+        return NULL;
+    }
+    BCSpinMutex::Owner lock(lock_);
+    // Pin the tunnel to the inner connection's event managers so the pair is
+    // serialised on a single thread (all masque_* hand-offs then run without
+    // cross-thread races, and the tunnel can be deleted safely by the inner).
+    BCRESULT result = tunnel->Create(this, MasqueTunnelHandler::Instance(),
+                                     &cfg, next_conn_id_++,
+                                     inner->task_mgr_, inner->timer_mgr_);
+    if (result != BC_R_SUCCESS)
+    {
+        delete tunnel;
+        return NULL;
+    }
+    tunnel->masque_role_  = SMPConnection::MASQUE_TUNNEL;
+    tunnel->masque_inner_ = inner;
+    // The CONNECT-UDP target is the inner connection's real server; copy it so
+    // the tunnel can build the request path (the inner stashed it in its gate).
+    tunnel->masque_target_host_ = inner->masque_target_host_;
+    tunnel->masque_target_port_ = inner->masque_target_port_;
+    // Intentionally NOT inserted into conns_map_ and NOT counted in stats: the
+    // tunnel is internal and invisible to the application (no app-facing close
+    // callback). Its lifetime is fully owned by the inner connection.
+    return tunnel;
 }
 
 void SMPConnector::NotifyConnClosed(uint64_t conn_id)
@@ -2419,6 +3309,34 @@ int SMPConnector::on_conn_cert_verify(
         return -1;
     }
     SMPConnector *connector = user_conn->connector_;
+
+    // SPKI-pin path (outer self-hosted-proxy hop, see design §9.6): verify the
+    // leaf's public-key fingerprint instead of CA-chain. Fully isolated from the
+    // inner CA-chain path below — a connection carries EITHER spki_pin OR
+    // ca_cert_pem, never both, so the inner chative-CA verification is untouched.
+    if (user_conn->config_.spki_pin && user_conn->config_.spki_pin_len > 0
+        && !(user_conn->config_.proxy_host && user_conn->config_.proxy_host[0] != '\0')) {
+        const unsigned char *p = certs[0];
+        X509 *leaf = d2i_X509(nullptr, &p, cert_len[0]);
+        if (!leaf) {
+            user_conn->cert_verify_error_ = "spki pin: failed to parse leaf cert";
+            LogQ(connector->logger_ctx_, _ERROR_, "spki pin: failed to parse leaf cert");
+            return -1;
+        }
+        std::string computed = computeSpkiPinBase64(leaf);
+        X509_free(leaf);
+        std::string expected = canonicalizeSpkiPin(
+            user_conn->config_.spki_pin, user_conn->config_.spki_pin_len);
+        if (!computed.empty() && computed == expected) {
+            LogQ(connector->logger_ctx_, _INFO_, "spki pin: matched");
+            return 0;
+        }
+        user_conn->cert_verify_error_ = "spki pin mismatch";
+        LogQ(connector->logger_ctx_, _ERROR_,
+            "spki pin: MISMATCH computed=%s expected=%s",
+            computed.c_str(), expected.c_str());
+        return -1;
+    }
 
     const std::vector<X509*>* trusted_cas = !user_conn->root_cas_.empty()
         ? &user_conn->root_cas_
@@ -2807,6 +3725,24 @@ SMPConnector::on_h3_stream_close_notify(
     }
 
     return 0;
+}
+
+void
+SMPConnector::on_h3_ext_datagram_read(
+    xqc_h3_conn_t *conn,
+    const void *data,
+    size_t data_len,
+    void *user_data,
+    uint64_t data_recv_time)
+{
+    // user_data is the MASQUE tunnel SMPConnection (set in OnH3ConnCreate via
+    // xqc_h3_ext_datagram_set_user_data). Route the raw HTTP/3 datagram into
+    // the tunnel for RFC 9297/9298 decode + delivery to its inner connection.
+    SMPConnection *tunnel = (SMPConnection*)user_data;
+    if (tunnel && data && data_len > 0)
+    {
+        tunnel->MasqueOnDatagram((const uint8_t*)data, data_len);
+    }
 }
 
 ssize_t 

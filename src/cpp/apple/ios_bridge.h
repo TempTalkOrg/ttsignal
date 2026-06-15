@@ -58,6 +58,23 @@ typedef struct {
     int32_t     numOfSenders;
     const char* serverHost;
     const char* caCertPem;
+    // Outbound MASQUE proxy (RFC 9298 CONNECT-UDP). When set, connections
+    // tunnel their QUIC traffic through the proxy instead of dialing the
+    // target directly. proxyUrl is the primary input; proxyHost / proxyPort /
+    // proxySni override the parsed values. NULL/empty/0 = direct (no proxy).
+    // The bridge only forwards these to BCFObject when non-empty, since the
+    // native Config treats a present proxy_host (even empty) or a non-zero
+    // proxy_port as "enable proxy" — see ConvertConfig in ios_bridge.mm.
+    const char* proxyUrl;
+    const char* proxyHost;
+    int32_t     proxyPort;   // 0 = unset (defaults to 443 when proxy enabled)
+    const char* proxySni;
+    // Self-signed root CA (PEM) used to verify the outer hop to the proxy.
+    // NULL/empty = use the system trust store for the proxy's TLS cert.
+    const char* proxyCaCertPem;
+    // Base64 SHA-256 SPKI pin for the proxy's leaf certificate. When set, the
+    // outer CONNECT-UDP hop is pinned to this public key. NULL/empty = no pin.
+    const char* spkiPin;
     // Off-switch for SMPConnector's built-in auto-restart on path changes.
     // 0 (default) keeps the AppleNetworkMonitor → SMPConnection::Restart
     // pipeline live, which is what apps want — they get free QUIC
@@ -66,6 +83,16 @@ typedef struct {
     // (mirrors the NAPI `config.disableAutoRestart`) where you don't
     // want NWPathMonitor jitter to bounce well-behaved connections.
     int32_t     disableAutoRestart;
+    // Tri-state: -1 (default) keeps the platform default, 0 forces "let
+    // QUIC ride VPN/utun tunnels when the OS prefers them", 1 forces
+    // "always prefer wifi/wired/cellular over a tunnel". macOS is the
+    // only platform that consults this; iOS / Linux / Windows monitors
+    // accept the value for API parity but ignore it. See
+    // TTNetworkMonitorOptions::bypassVpn in INetworkPathMonitor.h.
+    // We use -1 as the sentinel (rather than just "0 = unset") so that
+    // C-struct zero-initialised callers still get the safe default, and
+    // an explicit caller can pick either side.
+    int32_t     bypassVpn;
 } TTConfig;
 
 ///////////////////////////////////////////////////////////////////////////////

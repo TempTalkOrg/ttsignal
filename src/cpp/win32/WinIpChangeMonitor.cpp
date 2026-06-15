@@ -239,8 +239,16 @@ static VOID WINAPI OnIpIfChange(PVOID context,
 
 extern "C" {
 
-TTNetworkMonitorRef tt_netmon_start(TTPathChangeCallback cb, void* userdata)
+TTNetworkMonitorRef tt_netmon_start(const TTNetworkMonitorOptions* options,
+                                    TTPathChangeCallback cb,
+                                    void* userdata)
 {
+    // bypassVpn intentionally ignored — see LinuxNetlinkMonitor.cpp for the
+    // reasoning. NotifyIpInterfaceChange tells us "the default route
+    // changed", not "what kind of media won", so there is no clean way to
+    // filter tunnels here without inspecting the IP_ADAPTER_ADDRESSES_LH
+    // tunnel flag — overkill for desktop server use.
+    (void)options;
     if (!cb) return nullptr;
     Monitor* self = new Monitor();
     self->callback = cb;

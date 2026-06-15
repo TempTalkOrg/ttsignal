@@ -256,8 +256,15 @@ if (BUILD_NODE_ADDON)
         if (APPLE)
             # AppleNetworkMonitor.mm uses ObjC dispatch + Network.framework;
             # ARC keeps reference counts sane without manual retain/release.
-            set_source_files_properties(${TT_APPLE_MONITOR_SOURCES}
-                PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+            # Plain .cpp files (e.g. AppleRouteLookup.cpp) MUST NOT receive
+            # -fobjc-arc, otherwise clang emits an unused-arg warning that
+            # -Werror upgrades into a build failure.
+            foreach(_tt_apple_src IN LISTS TT_APPLE_MONITOR_SOURCES)
+                if (_tt_apple_src MATCHES "\\.mm$")
+                    set_source_files_properties(${_tt_apple_src}
+                        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+                endif()
+            endforeach()
         endif()
     endif()
 
@@ -504,11 +511,15 @@ if (BUILD_IOS_FRAMEWORK)
     )
 
     # ARC for the .mm bridge files. Plain .cpp/.c files get compiled the
-    # normal way (no ObjC runtime).
-    set_source_files_properties(
-        ${TT_APPLE_MONITOR_SOURCES}
-        ${TT_IOS_BRIDGE_SOURCES}
-        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    # normal way (no ObjC runtime). We must filter manually because
+    # TT_APPLE_MONITOR_SOURCES now also contains AppleRouteLookup.cpp,
+    # which is plain C++.
+    foreach(_tt_ios_src IN LISTS TT_APPLE_MONITOR_SOURCES TT_IOS_BRIDGE_SOURCES)
+        if (_tt_ios_src MATCHES "\\.mm$")
+            set_source_files_properties(${_tt_ios_src}
+                PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        endif()
+    endforeach()
 
     # Link against pre-built static archives.
     target_link_libraries(ttsignal_ios PRIVATE

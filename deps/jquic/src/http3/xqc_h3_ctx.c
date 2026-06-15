@@ -39,6 +39,15 @@ xqc_h3_ctx_init(xqc_engine_t *engine, xqc_h3_callbacks_t *h3_cbs)
         .wt_stream_cbs  = h3_cbs->wt_stream_cbs,
     };
 
+    /* ttsignal: also wire the HTTP/3 datagram (RFC 9297) read callbacks onto the
+     * plain "h3"/"h3-29" ALPNs, not just "h3-ext". A standard MASQUE CONNECT-UDP
+     * proxy negotiates ALPN "h3", so without this the inbound QUIC DATAGRAM frames
+     * have no transport-layer notify and are silently dropped. Sending already
+     * works via xqc_h3_ext_datagram_send regardless of ALPN. */
+    if (engine->config->enable_h3_ext) {
+        ap_cbs.dgram_cbs = h3_ext_datagram_callbacks;
+    }
+
     /* register ALPN and transport layer callbacks */
     if (xqc_engine_register_alpn(engine, XQC_ALPN_H3, strlen(XQC_ALPN_H3), &ap_cbs) != XQC_OK
         || xqc_engine_register_alpn(engine, XQC_ALPN_H3_29, strlen(XQC_ALPN_H3_29), &ap_cbs) != XQC_OK)

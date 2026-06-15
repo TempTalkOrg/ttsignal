@@ -84,12 +84,42 @@ static BCFObject* ConvertConfig(const TTConfig* cfg)
     if (cfg->caCertPem && cfg->caCertPem[0]) {
         p->PutString("ca_cert_pem",           cfg->caCertPem);
     }
+    // Outbound MASQUE proxy (RFC 9298). Only emit when actually set: native
+    // Config treats a present proxy_host (even empty) or a non-zero proxy_port
+    // as "enable proxy", and proxy_port=0 would clobber the port parsed from
+    // proxy_url. Matches the JNI/Node bindings.
+    if (cfg->proxyUrl && cfg->proxyUrl[0]) {
+        p->PutString("proxy_url",             cfg->proxyUrl);
+    }
+    if (cfg->proxyHost && cfg->proxyHost[0]) {
+        p->PutString("proxy_host",            cfg->proxyHost);
+    }
+    if (cfg->proxyPort > 0) {
+        p->PutInt("proxy_port",               cfg->proxyPort);
+    }
+    if (cfg->proxySni && cfg->proxySni[0]) {
+        p->PutString("proxy_sni",             cfg->proxySni);
+    }
+    if (cfg->proxyCaCertPem && cfg->proxyCaCertPem[0]) {
+        p->PutString("proxy_ca_cert_pem",     cfg->proxyCaCertPem);
+    }
+    if (cfg->spkiPin && cfg->spkiPin[0]) {
+        p->PutString("spki_pin",              cfg->spkiPin);
+    }
     // SMPConnector reads this with the exact `disableAutoRestart` key
     // (see SMPConnector.cpp ~line 1855 + the !config_.disableAutoRestart
     // branch around tt_netmon_start). Always emit it so server-side
     // deployments can opt out without depending on the C-struct default
     // happening to be 0.
     p->PutBool("disableAutoRestart",          BoolField(cfg->disableAutoRestart));
+    // bypassVpn uses -1 ("unset") as the C-struct default so that
+    // zero-init callers don't accidentally flip the macOS behaviour to
+    // "ride VPN" — only emit a BCFObject key when the caller actually
+    // expressed a preference. SMPConnector::Config::bypassVpn already
+    // defaults to true, so omitting the key keeps the safe default.
+    if (cfg->bypassVpn == 0 || cfg->bypassVpn == 1) {
+        p->PutBool("bypassVpn",               BoolField(cfg->bypassVpn));
+    }
     return p;
 }
 

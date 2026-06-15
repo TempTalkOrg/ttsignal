@@ -96,6 +96,38 @@ BCFObject *SMPConfig::ConvertFromJava(JNIEnv *env, jobject obj)
 	if (!strValue.empty()) {
 		pConfig->PutString("ca_cert_pem", strValue);
 	}
+	// Per-connection outbound MASQUE proxy (RFC 9298 CONNECT-UDP). Only emit
+	// the keys when actually set: the native Config treats a present (even
+	// empty) proxy_host / non-zero proxy_port as "enable proxy", and
+	// proxy_port=0 would clobber the port parsed from proxy_url. Mirror the
+	// camelCase->snake_case forwarding the Node binding does in
+	// src/js/index.js.
+	JniUtils::GetStringField(env, obj, cls, "proxyUrl", strValue);
+	if (!strValue.empty()) {
+		pConfig->PutString("proxy_url", strValue);
+	}
+	JniUtils::GetStringField(env, obj, cls, "proxyHost", strValue);
+	if (!strValue.empty()) {
+		pConfig->PutString("proxy_host", strValue);
+	}
+	{
+		int proxyPort = JniUtils::GetIntField(env, obj, cls, "proxyPort");
+		if (proxyPort > 0) {
+			pConfig->PutInt("proxy_port", proxyPort);
+		}
+	}
+	JniUtils::GetStringField(env, obj, cls, "proxySni", strValue);
+	if (!strValue.empty()) {
+		pConfig->PutString("proxy_sni", strValue);
+	}
+	JniUtils::GetStringField(env, obj, cls, "proxyCaCertPem", strValue);
+	if (!strValue.empty()) {
+		pConfig->PutString("proxy_ca_cert_pem", strValue);
+	}
+	JniUtils::GetStringField(env, obj, cls, "spkiPin", strValue);
+	if (!strValue.empty()) {
+		pConfig->PutString("spki_pin", strValue);
+	}
 	env->DeleteLocalRef(cls);
 	return pConfig;
 }
