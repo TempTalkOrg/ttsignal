@@ -5,6 +5,7 @@
 
 #include "../StdAfx.h"
 #include <inttypes.h>
+#include "../TTErrors.h"
 #include "Utils.h"
 #include <BC/Utils.h>
 #include <BC/BCFCodec.h>
@@ -60,6 +61,42 @@ void InitSymbols(Napi::Env env)
             G_isElectron.store(!versions.Get("electron").IsUndefined());
         }
     }
+}
+
+
+///////////////////////////////////////////////////////////////////////////////
+// DrainPendingException —— 每次调完 JS 都必须走一遍
+//
+// ⚠️ 不清 pending exception 会把**整个 node 进程打死**，而且机制不在调用方那个
+// 文件里：
+//
+//   macros.h:21-26 的 TRY_CATCH_CALL 抓到 C++ 异常之后调
+//   ThrowAsJavaScriptException()，把一个 pending exception 留在 env 里
+//   **没人清**；而 JsExchanger::OnEventProcess 与
+//   UVEventFactory::_EventCallback（UVExchanger.cpp:192-213）都没有 catch。
+//   于是同一批 uv_async 里的**下一个**事件一旦调到 Napi::String::New /
+//   Object::New / Buffer::Copy 这类"在 TRY_CATCH_CALL 之外"的 napi 调用
+//   （各绑定构造回调参数时全是），node-addon-api 就因为 env 里挂着异常而直接抛
+//   C++ 异常，逃出事件泵 -> libc++abi: terminating。
+//
+// 这条对两套绑定都是"必现"级别：HTTP 侧实测 6 条并发请求、第一条回调 throw，
+// 修复前 100% SIGABRT（exit 134）；WS 侧一次 read 里的多个帧就是同一批多个事件，
+// 更容易撞上（实测服务端一次 write 送 6 个文本帧，第一个回调 throw 即中）。
+// 只发一条时更阴 —— 异常会从**后面某次毫不相干的原生调用里**抛出来，此后所有
+// 回调静默丢失，而 uv_ref 又让进程不退出，变成永久静默卡住。
+//
+// napi_fatal_exception 把它按 Node 的 uncaughtException 上报（业务的
+// process.on('uncaughtException') 收得到，默认行为也和普通 JS 异常一致），同时
+// 把 env 清干净，后续事件不受影响。
+///////////////////////////////////////////////////////////////////////////////
+
+void DrainPendingException(Napi::Env env)
+{
+	if (env.IsExceptionPending())
+	{
+		Napi::Error hError = env.GetAndClearPendingException();
+		napi_fatal_exception(env, hError.Value());
+	}
 }
 
 Napi::Value ConvertJSFromBCF(Napi::Env env, BCFVar *pVar)

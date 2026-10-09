@@ -67,7 +67,10 @@ public:
                     BCFObject *pConfig,
                     IUDPSenderHandler *pHandler,
                     bool bindIP = false,
-                    bool bindPort = false);
+                    bool bindPort = false,
+                    // 见 UDPSender::Create 的同名参数：在建 socket 之前就
+                    // 把网卡绑定好，否则初始 socket 永远走内核默认路由。
+                    int64_t initialNetworkHandle = 0);
     BCRESULT    Restart(int64_t networkHandle = 0);
     BCRESULT    Connect(BCSockAddrS& refSockAddr);
     BCRESULT    StartRecv();
@@ -76,6 +79,8 @@ public:
                     LPCVOID lpData,
                     size_t nSize);
     BCRESULT    GetSockName(BCSockAddrS& refAddr);
+    // 把策略转发给组内每一个 sender。见 UDPSender::SetVpnPolicy。
+    void        SetVpnPolicy(TTVpnPolicy policy);
     void        Close();
     void        Destroy(UDPSenderGroup **ppSender);
 

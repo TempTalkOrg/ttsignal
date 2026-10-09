@@ -25,11 +25,19 @@ set(TT_APPLE_MONITOR_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/AppleNetworkMonitor.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../INetworkPathMonitor.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../NetworkRouteLookup.h
+    # 必须导出：INetworkPathMonitor.h 会 #include 它（TTVpnPolicy 与
+    # TTNetworkMonitorOptions::vpnPolicy 都要用）。漏掉它会让 xcframework
+    # 的 TTSignalC module 在下游直接编不过——'VpnPolicy.h' file not found。
+    ${CMAKE_CURRENT_SOURCE_DIR}/../VpnPolicy.h
 )
 
 set(TT_IOS_BRIDGE_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/ios_bridge.mm
     ${CMAKE_CURRENT_SOURCE_DIR}/ios_logger.mm
+    # HTTP/WS 栈的桥接单独一个 .mm —— llhttp.h 与 http-parser/http_parser.h
+    # 定义了同名的 HPE_* 枚举，并进 ios_bridge.mm 会得到一堆
+    # "redefinition of enumerator 'HPE_OK'"。详见该文件顶部注释。
+    ${CMAKE_CURRENT_SOURCE_DIR}/ios_http_bridge.mm
 )
 
 set(TT_IOS_BRIDGE_HEADERS

@@ -90,9 +90,24 @@ if (NOT BUILD_IOS_FRAMEWORK)
     add_subdirectory(${BASE_DIR}/../deps/env/src deps/env.dir)
     add_subdirectory(${BASE_DIR}/../deps/boringssl/src deps/boringssl.dir)
     add_subdirectory(${BASE_DIR}/../deps/jquic deps/jquic.dir)
+    # llhttp：HTTP 报文解析（LLHTTPParser.cpp / HttpConnector.cpp /
+    # WSConnector.cpp 的握手都要用）。iOS 分支不走这里 —— 它链的是
+    # build-deps.sh 预编的静态库，还没有 libllhttp.a，因此下面把 HTTP/WS 那四个
+    # .cpp 排除在 iOS 目标之外。
+    add_subdirectory(${BASE_DIR}/../deps/llhttp/src deps/llhttp.dir)
 endif()
 
-add_definitions(-D__STDC_LIMIT_MACROS -DHAVE_PTHREAD -DCR_USE_FALLBACKS_FOR_GCC_WITH_LIBCXX 
+# __STDC_FORMAT_MACROS：和旁边的 __STDC_LIMIT_MACROS 是同一族老 ISO C99 开关。
+# 老 glibc（Linux aarch64 交叉工具链 gcc 13.3 的 sysroot）在 C++ 下把 PRIu64 等
+# PRI 宏挡在 `#if !defined __cplusplus || defined __STDC_FORMAT_MACROS` 后面，
+# 不显式请求就一个都不定义（WSConnector.cpp / SMPServer.cpp 的日志格式串要用）。
+#
+# 为什么必须在命令行上定义、光在 .cpp 里 #include <cinttypes> 不够：
+# 那些 .cpp 第一行是 #include "StdAfx.h"，它经 BC/* 早已把 <inttypes.h> 拉进来了。
+# <cinttypes> 的实现是「define __STDC_FORMAT_MACROS → include <inttypes.h> →
+# undef」，可此时 _INTTYPES_H 的 include guard 已经生效，头文件不会二次展开，
+# PRI 宏于是永远补不上。命令行 -D 在所有 include 之前生效，不受顺序影响。
+add_definitions(-D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -DHAVE_PTHREAD -DCR_USE_FALLBACKS_FOR_GCC_WITH_LIBCXX
         -DNOMINMAX
         -DXQC_ENABLE_BBR2
         -DXQC_ENABLE_RENO
@@ -198,6 +213,7 @@ include_directories(
     ${BASE_DIR}/../deps/env/src
     ${BASE_DIR}/../deps/boringssl/src/include
     ${BASE_DIR}/../deps/jquic/include
+    ${BASE_DIR}/../deps/llhttp/include
     ${BASE_DIR}/cpp
 )
 
@@ -221,7 +237,6 @@ if (BUILD_NODE_ADDON)
         ${BASE_DIR}/cpp/http-parser/http_parser.c
         ${NODE_ADDON_SRC_DIR}/*.cpp
     )
-
     # ----------------------------------------------------------------------
     # Cross-platform path-change monitor (INetworkPathMonitor):
     #   * Apple (macOS NAPI) -> src/cpp/apple/AppleNetworkMonitor.mm
@@ -266,6 +281,27 @@ if (BUILD_NODE_ADDON)
                 endif()
             endforeach()
         endif()
+    endif()
+
+    # ----------------------------------------------------------------------
+    # Configure 期断言：Node addon 必须带 path monitor。
+    #
+    # 少了 TT_HAS_PATH_MONITOR，TcpChannel::_PickPhysicalIfIndex() 整段会被
+    # 条件编译掉、恒返回 0：prefer-physical（桌面默认档）静默回落系统路由，
+    # 也就是 VPN 隧道；force-physical 不会静默（TcpChannel.cpp:414-425 的硬校验
+    # 写在 guard 之外，直接 return BC_R_NO_PHYSICAL_INTERFACE=64），但整条
+    # "用真实 IP 出网" 的能力就没了。
+    #
+    # 这类缺陷极难从行为上看出来（Task 0b 白查很久），所以宁可 configure 期就
+    # 停下。运行期还有一道：__info__().hasPathMonitor —— 那一道连手搓编译命令
+    # 编出来的产物也管得到，这里的断言管不到。
+    # ----------------------------------------------------------------------
+    if (NOT TT_PATH_MONITOR_SOURCES)
+        message(FATAL_ERROR
+            "BUILD_NODE_ADDON needs the path monitor: TT_HAS_PATH_MONITOR is not "
+            "defined for this platform, so prefer-physical would silently fall "
+            "back to the system route (VPN tunnel) and force-physical would "
+            "hard-fail with BC_R_NO_PHYSICAL_INTERFACE (64).")
     endif()
 
     if (WIN32)
@@ -360,6 +396,7 @@ if (BUILD_NODE_ADDON)
         PRIVATE
         env
         jquic
+        llhttp
         ssl
         crypto
         ${CMAKE_DL_LIBS}
@@ -402,7 +439,6 @@ if (BUILD_JNI)
         ${BASE_DIR}/cpp/http-parser/http_parser.c
         ${BASE_DIR}/cpp/jni/*.cpp
     )
-
     # message(${JNI_SRC_FILES})
 
 
@@ -436,10 +472,11 @@ if (BUILD_JNI)
     add_dependencies(${LIB_NAME}jni touch_utils)
 
     target_link_libraries( 
-        ${LIB_NAME}jni 
+        ${LIB_NAME}jni
         PRIVATE
         env
         jquic
+        llhttp
         ssl
         crypto
         ${EXTRA_LIBS}
@@ -490,6 +527,14 @@ if (BUILD_IOS_FRAMEWORK)
         ${BASE_DIR}/cpp/*.cpp
         ${BASE_DIR}/cpp/http-parser/http_parser.c
     )
+    # HttpConnector / LLHTTPParser / WSConnector / WSParser 这四个依赖 llhttp 的
+    # 文件曾经在这里被 REMOVE_ITEM 掉 —— 那时 ios/scripts/build-deps.sh 只编
+    # boringssl / env / jquic，build/ios-deps/<sdk>-<arch>/lib/ 下没有
+    # libllhttp.a，不排除就会在链接期报 llhttp_init / llhttp_execute 一串
+    # undefined symbol，于是 iOS 侧没有 HTTP/WS 能力。
+    # 现在 build-deps.sh 已经照 env 的写法把 llhttp 也编成三 slice 静态库
+    # （纯 C，三个 .c，无外部依赖），下面也链上了 ${IOS_DEPS_DIR}/libllhttp.a，
+    # 因此四个文件正常参与编译，iOS 与 Android / Node 的能力面对齐。
 
     add_library(ttsignal_ios STATIC
         ${TT_IOS_CORE_SRC}
@@ -508,6 +553,7 @@ if (BUILD_IOS_FRAMEWORK)
         ${BASE_DIR}/../deps/env/src
         ${BASE_DIR}/../deps/boringssl/src/include
         ${BASE_DIR}/../deps/jquic/include
+        ${BASE_DIR}/../deps/llhttp/include
     )
 
     # ARC for the .mm bridge files. Plain .cpp/.c files get compiled the
@@ -525,6 +571,7 @@ if (BUILD_IOS_FRAMEWORK)
     target_link_libraries(ttsignal_ios PRIVATE
         ${IOS_DEPS_DIR}/libenv.a
         ${IOS_DEPS_DIR}/libjquic.a
+        ${IOS_DEPS_DIR}/libllhttp.a
         ${IOS_DEPS_DIR}/libssl.a
         ${IOS_DEPS_DIR}/libcrypto.a
     )
@@ -558,3 +605,16 @@ if (BUILD_IOS_FRAMEWORK)
 
     message(STATUS "ttsignal: iOS framework bits staged at ${_TT_IOS_STAGE}")
 endif() # BUILD_IOS_FRAMEWORK
+# ---------------------------------------------------------------------------
+# 命令行验证工具（tools/httpget）。默认关闭，不进任何发行产物。
+#   cmake ../src -DBUILD_NODE_ADDON=ON -DBUILD_TOOLS=ON && make httpget
+# 必须放在文件末尾：tools/CMakeLists.txt 要用上面算好的 TT_PATH_MONITOR_*
+# 变量，也要继承 BUILD_NODE_ADDON 分支里 add_definitions 的 TT_HAS_PATH_MONITOR。
+# ---------------------------------------------------------------------------
+option(BUILD_TOOLS "Build command-line verification tools" OFF)
+if(BUILD_TOOLS)
+    if(BUILD_IOS_FRAMEWORK)
+        message(FATAL_ERROR "BUILD_TOOLS 与 BUILD_IOS_FRAMEWORK 不能同时开启")
+    endif()
+    add_subdirectory(${BASE_DIR}/../tools tools.dir)
+endif()

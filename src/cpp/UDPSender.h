@@ -9,6 +9,7 @@
 #include "BC/BCSocket.h"
 #include "BC/BCFCodec.h"
 #include "BC/BCEventQueue.h"
+#include "VpnPolicy.h"
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -128,7 +129,18 @@ public:
 						BCFObject *pConfig,
 						IUDPSenderHandler *pHandler,
 						bool bindIP = false,
-						bool bindPort = false);
+						bool bindPort = false,
+						// 建 socket 之前就设好的网卡句柄（Apple/Windows/Linux
+						// 是 ifIndex，Android 是 network_handle_t）。0 表示
+						// 不绑定，由内核按默认路由决定出口——这也是历史行为。
+						//
+						// 为什么需要它：_InitSocket 在 Create 里就执行，那时
+						// m_nNetworkHandle 还是 0，所以初始 socket 从来不绑定
+						// 网卡；只有后续 Restart(ifIndex) 才会绑。结果是网络
+						// 稳定、从不切网的场景下 vpnPolicy 完全不起作用，包照样
+						// 走内核默认路由（TUN 代理下就是 VPN）。用 Restart() 补
+						// 救不行——它是异步投递事件，和 Connect 存在竞态。
+						int64_t initialNetworkHandle = 0);
 	BCRESULT 		Restart(bool checkAvailable = false, int64_t networkHandle = 0);
 	BCRESULT		Start(LPCSTR szHost, uint16_t nPort);
 	BCRESULT		StartRecv();
@@ -142,6 +154,15 @@ public:
 						BCRegionS *io_vec,
 						size_t iovec_len);
 	BCRESULT		GetSockName(BCSockAddrS& refAddr);
+	// 设置生效的 VPN 策略。必须在 Connect() 之前调用；SMPConnection::Create
+	// 在 UDPSenderGroup::Create 成功后立刻调用，此时 socket 已建好但还没
+	// connect，正是时机。
+	//
+	// TT_VPN_POLICY_FORCE_PHYSICAL 下，本对象拒绝撤销已有的网卡绑定——
+	// 无论是 Connect() 里的路由表主动校验，还是 _OnConnectDone 收到
+	// ENETUNREACH 的被动回收。业务显式要求"必须走物理网卡"，那么"连不上"
+	// 就是正确结果，静默回落到 VPN 才是错的。
+	void			SetVpnPolicy(TTVpnPolicy policy) { m_eVpnPolicy = policy; }
 	void			Close();
 	void			Destroy(UDPSender **ppSender);
 
@@ -258,6 +279,10 @@ private:
 	// Guards _TryClearInterfaceBinding from un-pinning twice per socket
 	// life so we don't flap setsockopt under a flood of NETUNREACH errors.
 	bool 					m_bInterfaceBindingActive;
+	// 生效的 VPN 策略，由 SMPConnection::Create 经 UDPSenderGroup 下发。
+	// 默认 UNSET，等同于"不抑制解绑"，也就是改动前的历史行为——SMPServer
+	// 等不走 connector 配置的调用方因此不受影响。
+	TTVpnPolicy				m_eVpnPolicy;
 };
 
 #endif // UDPSENDER_H_INCLUDED__

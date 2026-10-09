@@ -21,7 +21,17 @@ set(CMAKE_CXX_FLAGS "-fexceptions")
 set(BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
 
-set(LIBRARY_OUTPUT_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../lib/${CMAKE_BUILD_TYPE})
+# 输出路径必须带平台 + 架构，与 deps/env、deps/jquic 的约定一致
+# （lib/<System>/<Processor>/<Config>）。
+#
+# 早先这里只有 lib/${CMAKE_BUILD_TYPE}，四个平台共用同一个 libllhttp.a：
+# scripts/build-for-linux-and-macos.sh 依次编 linux-x64 → linux-arm64 →
+# macos-arm64 → macos-x64，后一个 target 看到 .a 比三个 .c 新就不重编，直接
+# 链上一个架构的库，于是报
+#   Relocations in generic ELF (EM: 183) / file in wrong format
+# EM 183 = aarch64。谁先谁后决定了哪个平台挂，清掉 build/ 也不管用 —— 产物在
+# deps/ 里，不在 build/ 里。
+set(LIBRARY_OUTPUT_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../lib/${CMAKE_SYSTEM_NAME}/${CMAKE_SYSTEM_PROCESSOR}/${CMAKE_BUILD_TYPE})
 
 INCLUDE_DIRECTORIES(
         ${BASE_DIR}/../include

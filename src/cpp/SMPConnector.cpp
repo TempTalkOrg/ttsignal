@@ -25,6 +25,7 @@
 #include "BC/BCJson.h"
 #include "Utils.h"
 #include "MasqueFraming.h"
+#include "TlsContext.h"
 
 
 #define XQC_PACKET_TMP_BUF_LEN 1500
@@ -128,89 +129,10 @@ BCRESULT parsePemCertBundle(
     return BC_R_SUCCESS;
 }
 
-int addTrustedCAsToStore(X509_STORE* store, const std::vector<X509*>& certs, LPVOID logger_ctx)
-{
-    for (X509* cert : certs) {
-        if (!cert) {
-            continue;
-        }
-        if (X509_STORE_add_cert(store, cert) == 1) {
-            continue;
-        }
-
-        const unsigned long err_code = ERR_peek_last_error();
-#ifdef X509_R_CERT_ALREADY_IN_HASH_TABLE
-        if (ERR_GET_LIB(err_code) == ERR_LIB_X509
-            && ERR_GET_REASON(err_code) == X509_R_CERT_ALREADY_IN_HASH_TABLE) {
-            ERR_clear_error();
-            continue;
-        }
-#endif
-        char err_buf[256] = {0};
-        ERR_error_string_n(err_code, err_buf, sizeof(err_buf));
-        LogQ(logger_ctx, _ERROR_, "cert verify: failed to add trusted CA to store: %s", err_buf);
-        ERR_clear_error();
-        return -1;
-    }
-    return 0;
-}
-
-// Canonicalize a base64 SPKI pin for comparison: map url-safe and space-decoded
-// variants back to standard base64 and strip padding/whitespace. Mirrors the
-// Android-side normalizeBase64Pin so a url-safe pin from the share link
-// (init-self-signed.sh: tr '+/' '-_') compares equal to the locally computed one.
-std::string canonicalizeSpkiPin(const char* pin, size_t len)
-{
-    std::string out;
-    out.reserve(len);
-    for (size_t i = 0; i < len; ++i) {
-        char c = pin[i];
-        switch (c) {
-            case '-': out.push_back('+'); break;   // url-safe -> standard
-            case '_': out.push_back('/'); break;   // url-safe -> standard
-            case ' ': out.push_back('+'); break;   // '+' decoded as space in transit
-            case '=':                              // drop padding
-            case '\r':
-            case '\n':
-            case '\t': break;                       // drop whitespace
-            default:  out.push_back(c); break;
-        }
-    }
-    return out;
-}
-
-// SHA-256(SubjectPublicKeyInfo) of the leaf, standard base64 (no padding).
-// Returns empty string on failure.
-std::string computeSpkiPinBase64(X509* leaf)
-{
-    if (!leaf) {
-        return std::string();
-    }
-    EVP_PKEY* pkey = X509_get_pubkey(leaf);
-    if (!pkey) {
-        return std::string();
-    }
-    // i2d_PUBKEY marshals the public key as a DER SubjectPublicKeyInfo — matches
-    // the server's `openssl pkey -pubin -outform der` (init-self-signed.sh).
-    unsigned char* spki_der = NULL;
-    int spki_len = i2d_PUBKEY(pkey, &spki_der);
-    EVP_PKEY_free(pkey);
-    if (spki_len <= 0 || !spki_der) {
-        return std::string();
-    }
-    unsigned char hash[SHA256_DIGEST_LENGTH];
-    SHA256(spki_der, (size_t)spki_len, hash);
-    OPENSSL_free(spki_der);
-
-    // EVP_EncodeBlock writes ceil(n/3)*4 + 1 bytes (incl. NUL) and returns the
-    // number of bytes written excluding the NUL.
-    unsigned char b64[((SHA256_DIGEST_LENGTH + 2) / 3) * 4 + 1];
-    size_t b64_len = EVP_EncodeBlock(b64, hash, SHA256_DIGEST_LENGTH);
-    if (b64_len == 0) {
-        return std::string();
-    }
-    return canonicalizeSpkiPin((const char*)b64, b64_len);
-}
+// addTrustedCAsToStore / canonicalizeSpkiPin / computeSpkiPinBase64 移到了
+// TlsContext（TlsContext::AddTrustedCAsToStore / CanonicalizeSpkiPin /
+// ComputeSpkiPinBase64），供 QUIC 与 TCP（HTTP/WS）两条路径共用，避免各写
+// 一份导致行为漂移。调用点见 on_conn_cert_verify。
 
 } // namespace
 
@@ -767,6 +689,8 @@ SMPConnection::Config::Config()
     , linger_on(false), ping_interval(0), active_connection_id_limit(0)
     , alpn(NULL), device_type(0)
     , ca_cert_pem(NULL), ca_cert_pem_len(0)
+    , vpn_policy(TT_VPN_POLICY_UNSET)
+    , android_net_handle(0)
     , proxy_type(TT_PROXY_NONE), proxy_host(NULL), proxy_port(0)
     , proxy_sni(NULL), proxy_url(NULL)
     , proxy_ca_cert_pem(NULL), proxy_ca_cert_pem_len(0)
@@ -875,6 +799,16 @@ BCRESULT SMPConnection::Config::Init(BCFObject* pConfig)
         ca_cert_pem = pool_.Strdup(GET_BCF_STRING(pVar));
         ca_cert_pem_len = strlen(ca_cert_pem);
     }
+    pVar = pConfig->Get("vpnPolicy");
+    if (IS_BCF_STRING(pVar))
+    {
+        vpn_policy = tt_vpn_policy_from_string(GET_BCF_STRING(pVar));
+    }
+    pVar = pConfig->Get("androidNetHandle");
+    if (IS_BCF_NUMBER(pVar))
+    {
+        android_net_handle = (uint64_t)GET_BCF_INT(pVar);
+    }
     // Outbound proxy (RFC 9298 CONNECT-UDP / MASQUE). Primary input is the
     // "proxy_url" key; explicit proxy_host / proxy_port / proxy_sni override
     // the parsed values for callers that prefer split fields.
@@ -972,6 +906,8 @@ BCRESULT SMPConnection::Create(
 {
     BCRESULT result;
     BCSockAddrS localAddr;
+    // 本函数用 goto 做错误清理，跨越声明会编译失败，所以提前声明。
+    int64_t initial_ifindex = 0;
 
     if (!connector || !pHandler || !pConfig)
     {
@@ -979,6 +915,10 @@ BCRESULT SMPConnection::Create(
         return BC_R_INVALIDARG;
     }
     config_.Init(pConfig);
+    if (config_.vpn_policy == TT_VPN_POLICY_UNSET)
+    {
+        config_.vpn_policy = connector->config_.vpn_policy;
+    }
     if (config_.alpn == NULL || config_.server_host == NULL) {
         LogQ(connector->logger_ctx_, _ERROR_, "invalid arguments: invalid alpn or server_host");
         return BC_R_INVALIDARG;
@@ -1011,12 +951,39 @@ BCRESULT SMPConnection::Create(
                 root_cas_.size());
         }
     }
-    result = udp_socket_->Create(connector->logger_ctx_, pTaskMgr, pTimerMgr, 
-        Runtime::SocketMgr(), pConfig, this, false, false);
+    // 在建 socket 之前先把要绑定的网卡定下来。
+    //
+    // 这一步以前是缺失的：_InitSocket() 在 UDPSender::Create 里就执行，那时
+    // m_nNetworkHandle 还是 0，所以初始 socket 从不绑定网卡；只有后续路径
+    // 变化触发 Restart(ifIndex) 才会绑。后果是网络稳定、从不切网的机器上
+    // vpnPolicy 完全不起作用——包照样走内核默认路由，TUN 代理下就是 VPN，
+    // 服务端看到的还是 VPN 出口 IP。INetworkPathMonitor.h 里
+    // tt_netmon_query_default_ifindex 的注释本来就写明它该在 connect 时被
+    // 调用，但一直没有接线，这里补上。
+    //
+    // os 档不查询也不绑定，保持内核默认路由——那正是该档的语义。
+    initial_ifindex = (int64_t)config_.android_net_handle;
+#if defined(TT_HAS_PATH_MONITOR)
+    if (initial_ifindex == 0 &&
+        config_.vpn_policy != TT_VPN_POLICY_OS)
+    {
+        initial_ifindex = tt_netmon_query_default_ifindex_ex(
+            (int)config_.vpn_policy);
+        LogQ(connector->logger_ctx_, _INFO_,
+            "SMPConnection: vpnPolicy=%s 初始网卡查询结果 ifIndex=%lld",
+            tt_vpn_policy_to_string(config_.vpn_policy),
+            (long long)initial_ifindex);
+    }
+#endif
+    result = udp_socket_->Create(connector->logger_ctx_, pTaskMgr, pTimerMgr,
+        Runtime::SocketMgr(), pConfig, this, false, false, initial_ifindex);
     if (result != BC_R_SUCCESS)
     {
         goto delete_socket;
     }
+    // 策略是 connector 级配置，但抑制解绑发生在每条连接的 UDPSender 里，
+    // 所以这里显式下发。时机：socket 已建好、尚未 Connect()，正合适。
+    udp_socket_->SetVpnPolicy(config_.vpn_policy);
     result = BCEventQueue::Create(pTimerMgr, pTaskMgr, "SMPConnection", this);
     if (result != BC_R_SUCCESS)
     {
@@ -1052,6 +1019,34 @@ BCRESULT SMPConnection::Connect(IRPCStub *pStub)
             if (state_ > CONN_STATE_INIT)
             {
                 _NotifyConnectResult(pStub, BC_R_ALREADYRUNNING);
+            }
+            // force-physical：没有可用物理网卡就不发包，直接以专属错误码
+            // 失败。让业务在一次回调里就能决策（降级到 prefer-physical 重连，
+            // 或提示用户关掉 VPN），而不是等一个分不清"网络慢"还是"被策略
+            // 挡住"的通用超时。
+            else if (config_.vpn_policy == TT_VPN_POLICY_FORCE_PHYSICAL
+                     && config_.android_net_handle == 0
+#if defined(TT_HAS_PATH_MONITOR)
+                     && tt_netmon_query_default_ifindex_ex(
+                            (int)TT_VPN_POLICY_FORCE_PHYSICAL) <= 0
+#endif
+                    )
+            {
+                // 把系统当前看到的默认出口一并打出来，用于区分"真的没有物理
+                // 网卡"和"物理网卡判定误判"——三平台的判定实现各不相同，这是
+                // 最主要的现场排查线索。
+                int64_t osBest = 0;
+#if defined(TT_HAS_PATH_MONITOR)
+                osBest = tt_netmon_query_default_ifindex_ex(
+                    (int)TT_VPN_POLICY_OS);
+#endif
+                LogQ(connector_->logger_ctx_, _ERROR_,
+                     "[SMPConnection] vpnPolicy=force-physical 但找不到可用物理"
+                     "网卡（系统默认出口 ifIndex=%lld）。连接不发起，返回 "
+                     "BC_R_NO_PHYSICAL_INTERFACE。常见原因：只挂了 VPN 而 "
+                     "Wi-Fi / 有线均未连接。",
+                     (long long)osBest);
+                _NotifyConnectResult(pStub, BC_R_NO_PHYSICAL_INTERFACE);
             }
             else
             {
@@ -2668,11 +2663,36 @@ BCRESULT SMPConnector::Config::Init(BCFObject* pConfig)
     {
         disableAutoRestart = GET_BCF_BOOL(pVar);
     }
+    // 旧键 bypassVpn（已废弃）与新键 vpnPolicy 合并，后者胜出。
+    //
+    // 本函数没有 logger context，所以这里只把"发现了什么"记进诊断位，
+    // 由 SMPConnector::Create 在 config_.Init 之后统一打告警。
+    bool hasBypassVpn = false;
     pVar = pConfig->Get("bypassVpn");
     if (IS_BCF_BOOL(pVar))
     {
-        bypassVpn = GET_BCF_BOOL(pVar);
+        bypassVpn    = GET_BCF_BOOL(pVar);
+        hasBypassVpn = true;
     }
+    TTVpnPolicy explicitPolicy = TT_VPN_POLICY_UNSET;
+    vpn_policy_bad_string      = NULL;
+    pVar = pConfig->Get("vpnPolicy");
+    if (IS_BCF_STRING(pVar))
+    {
+        LPCSTR raw = GET_BCF_STRING(pVar);
+        explicitPolicy = tt_vpn_policy_from_string(raw);
+        if (explicitPolicy == TT_VPN_POLICY_UNSET && raw && raw[0])
+        {
+            vpn_policy_bad_string = pool_.Strdup(raw);
+        }
+    }
+    int bothGiven = 0;
+    vpn_policy = tt_vpn_policy_resolve(explicitPolicy,
+                                       hasBypassVpn ? 1 : 0,
+                                       bypassVpn ? 1 : 0,
+                                       tt_vpn_policy_platform_default(),
+                                       &bothGiven);
+    vpn_policy_both_given = (bothGiven != 0);
     // Outbound proxy (RFC 9298 CONNECT-UDP / MASQUE). Primary input is the
     // "proxy_url" key; explicit proxy_host / proxy_port / proxy_sni override
     // the parsed values for callers that prefer split fields.
@@ -2852,7 +2872,7 @@ BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
     }
 
     handler_ = pHandler;
-    config_.Init(pConfig);    
+    config_.Init(pConfig);
 	if (config_.alpn.empty())
     {
         LogQ(logger_ctx_, _ERROR_, "invalid arguments: invalid alpn");
@@ -2876,6 +2896,25 @@ BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
         logger_ctx_ = AddFileLogAppender(config_.log_file, log_level, true, true);
     } else {
         logger_ctx_ = AddExternalLogAppender(log_callback, this, log_level, true);
+    }
+
+    // vpnPolicy 相关告警必须放在 logger_ctx_ 赋值之后——Config::Init 阶段
+    // 既没有 logger context，日志 appender 也还没装上，那时打的日志会直接
+    // 丢掉。Config::Init 只记诊断位，真正的告警在这里发出。
+    if (config_.vpn_policy_bad_string)
+    {
+        LogQ(logger_ctx_, _WARN_,
+             "[SMPConnector] 无法识别的 vpnPolicy=\"%s\"，已忽略；合法取值为 "
+             "os / prefer-physical / force-physical。本次回落为 %s",
+             config_.vpn_policy_bad_string,
+             tt_vpn_policy_to_string(config_.vpn_policy));
+    }
+    if (config_.vpn_policy_both_given)
+    {
+        LogQ(logger_ctx_, _WARN_,
+             "[SMPConnector] 同时配置了 vpnPolicy 与已废弃的 bypassVpn，"
+             "以 vpnPolicy=%s 为准，bypassVpn 被忽略",
+             tt_vpn_policy_to_string(config_.vpn_policy));
     }
     conn_settings_ = xqc_conn_get_conn_settings_template(XQC_CONN_SETTINGS_LOW_DELAY);
     if (config_.ping_on)
@@ -3046,7 +3085,12 @@ BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
     if (!config_.disableAutoRestart)
     {
         TTNetworkMonitorOptions netmon_opts{};
-        netmon_opts.bypassVpn = config_.bypassVpn ? 1 : 0;
+        // vpnPolicy 是权威字段。bypassVpn 仍然填上，是为了让"链接到旧版本
+        // monitor 实现"的场景仍有合理行为——结构体是公开 ABI，理论上不该
+        // 出现，但填一个自洽的值不花成本。
+        netmon_opts.vpnPolicy = (int)config_.vpn_policy;
+        netmon_opts.bypassVpn =
+            (config_.vpn_policy == TT_VPN_POLICY_OS) ? 0 : 1;
         netmon_opts.rawLogFn  = &SMPConnector::OnPathRawLog;
         netmon_opts.rawLogCtx = this;
         path_monitor_ = tt_netmon_start(&netmon_opts,
@@ -3059,8 +3103,8 @@ BCRESULT SMPConnector::Create(BCFObject* pConfig, IConnectorHandler* pHandler)
         else
         {
             LogQ(logger_ctx_, _INFO_,
-                 "[SMPConnector] tt_netmon_start ok bypassVpn=%d",
-                 netmon_opts.bypassVpn);
+                 "[SMPConnector] tt_netmon_start ok vpnPolicy=%s",
+                 tt_vpn_policy_to_string(config_.vpn_policy));
         }
     }
     else
@@ -3323,9 +3367,9 @@ int SMPConnector::on_conn_cert_verify(
             LogQ(connector->logger_ctx_, _ERROR_, "spki pin: failed to parse leaf cert");
             return -1;
         }
-        std::string computed = computeSpkiPinBase64(leaf);
+        std::string computed = TlsContext::ComputeSpkiPinBase64(leaf);
         X509_free(leaf);
-        std::string expected = canonicalizeSpkiPin(
+        std::string expected = TlsContext::CanonicalizeSpkiPin(
             user_conn->config_.spki_pin, user_conn->config_.spki_pin_len);
         if (!computed.empty() && computed == expected) {
             LogQ(connector->logger_ctx_, _INFO_, "spki pin: matched");
@@ -3342,97 +3386,105 @@ int SMPConnector::on_conn_cert_verify(
         ? &user_conn->root_cas_
         : &connector->root_cas_;
     if (trusted_cas->empty()) {
+        // 语义不变：SMP 未配置信任 CA 时跳过校验，直接放行。
+        //
+        // 这一步必须在调用 TlsContext::VerifyChain 之前完成——TlsContext
+        // 的语义是"caCertsPem 为空则回落系统信任库"，与这里"trusted_cas
+        // 为空则跳过校验"不同（是有意的行为差异，见 TlsContext.h 顶部
+        // 注释）。如果把这个判空去掉、指望 TlsContext 也跳过校验，会静默
+        // 地把已上线 QUIC 连接的安全行为改成"总是校验"。
         return 0;
     }
 
-    X509_STORE *store = X509_STORE_new();
-    if (!store) {
-        return -1;
+    // 组装证书链：certs[0] 必须是能解析的 leaf（解析失败即失败，语义与
+    // 迁移前一致），其余按顺序追加为中间证书，交给 TlsContext::VerifyChain
+    // 统一处理（CA store 构建、链校验、hostname 校验都挪到了那边）。
+    std::vector<X509*> chain;
+    chain.reserve(certs_len);
+    {
+        const unsigned char *p0 = certs[0];
+        X509 *leaf_cert = d2i_X509(nullptr, &p0, cert_len[0]);
+        if (!leaf_cert) {
+            return -1;
+        }
+        chain.push_back(leaf_cert);
     }
-    if (addTrustedCAsToStore(store, *trusted_cas, connector->logger_ctx_) != 0) {
-        X509_STORE_free(store);
-        return -1;
-    }
-
-    STACK_OF(X509) *chain = sk_X509_new_null();
-    X509 *leaf = nullptr;
-    for (size_t i = 0; i < certs_len; i++) {
+    for (size_t i = 1; i < certs_len; i++) {
         const unsigned char *p = certs[i];
         X509 *cert = d2i_X509(nullptr, &p, cert_len[i]);
-        if (!cert) continue;
-        if (i == 0) leaf = cert;
-        else sk_X509_push(chain, cert);
+        if (cert) {
+            chain.push_back(cert);
+        }
     }
 
-    int result = -1;
-    if (leaf) {
-        X509_STORE_CTX *ctx = X509_STORE_CTX_new();
-        if (ctx && X509_STORE_CTX_init(ctx, store, leaf, chain) == 1) {
-            if (X509_verify_cert(ctx) == 1) {
-                const char *host = user_conn->config_.server_host;
-                if (!host || strlen(host) == 0) {
-                    host = user_conn->host_.length() > 0
-                         ? user_conn->host_.c_str()
-                         : connector->config_.server_host;
-                }
-                if (host && strlen(host) > 0
-                    && X509_check_host(leaf, host,
-                        strlen(host), 0, nullptr) == 1) {
-                    result = 0;
-                } else {
-                    std::string msg = std::string("certificate hostname mismatch, expected=")
-                                    + (host ? host : "(null)");
-                    user_conn->cert_verify_error_ = msg;
-                    LogQ(connector->logger_ctx_, _ERROR_,
-                        "cert verify: %s", msg.c_str());
-                }
-            } else {
-                int err = X509_STORE_CTX_get_error(ctx);
-                std::string msg = std::string("certificate chain validation failed: ")
-                                + X509_verify_cert_error_string(err);
-                user_conn->cert_verify_error_ = msg;
-                LogQ(connector->logger_ctx_, _ERROR_,
-                    "cert verify: %s", msg.c_str());
-            }
-        }
-        if (result != 0) {
-            char subj_buf[256] = {0};
-            char issuer_buf[256] = {0};
-            X509_NAME_oneline(X509_get_subject_name(leaf), subj_buf, sizeof(subj_buf));
-            X509_NAME_oneline(X509_get_issuer_name(leaf), issuer_buf, sizeof(issuer_buf));
-            LogQ(connector->logger_ctx_, _ERROR_,
-                "cert verify: server leaf cert subject=%s, issuer=%s", subj_buf, issuer_buf);
-            for (int i = 0; i < sk_X509_num(chain); i++) {
-                X509 *ic = sk_X509_value(chain, i);
-                char ic_subj[256] = {0};
-                char ic_issuer[256] = {0};
-                X509_NAME_oneline(X509_get_subject_name(ic), ic_subj, sizeof(ic_subj));
-                X509_NAME_oneline(X509_get_issuer_name(ic), ic_issuer, sizeof(ic_issuer));
-                LogQ(connector->logger_ctx_, _ERROR_,
-                    "cert verify: chain[%d] subject=%s, issuer=%s", i, ic_subj, ic_issuer);
-            }
-            LogQ(connector->logger_ctx_, _ERROR_,
-                "cert verify: local trusted CA count=%zu", trusted_cas->size());
-            for (size_t i = 0; i < trusted_cas->size(); ++i) {
-                X509* ca_cert = (*trusted_cas)[i];
-                if (!ca_cert) {
-                    continue;
-                }
-                char ca_subj[256] = {0};
-                char ca_issuer[256] = {0};
-                X509_NAME_oneline(X509_get_subject_name(ca_cert), ca_subj, sizeof(ca_subj));
-                X509_NAME_oneline(X509_get_issuer_name(ca_cert), ca_issuer, sizeof(ca_issuer));
-                LogQ(connector->logger_ctx_, _ERROR_,
-                    "cert verify: trusted_ca[%zu] subject=%s, issuer=%s",
-                    i, ca_subj, ca_issuer);
-            }
-        }
-        if (ctx) X509_STORE_CTX_free(ctx);
-        X509_free(leaf);
+    const char *host = user_conn->config_.server_host;
+    if (!host || strlen(host) == 0) {
+        host = user_conn->host_.length() > 0
+             ? user_conn->host_.c_str()
+             : connector->config_.server_host;
     }
 
-    sk_X509_pop_free(chain, X509_free);
-    X509_STORE_free(store);
+    // TlsContext 只认 PEM 文本，不接受已解析好的 X509*；这里把跟
+    // trusted_cas 同一优先级来源（per-connection 优先于 per-connector）的
+    // 原始 PEM 文本传进去，让 TlsContext 内部重新解析建 store。caCertsPem
+    // 不能留空——上面已经保证 trusted_cas 非空，留空会走进 TlsContext 的
+    // "回落系统信任库"分支，语义就变了。
+    TlsConfig cfg;
+    const bool conn_has_ca = !user_conn->root_cas_.empty();
+    const char *ca_pem = conn_has_ca
+        ? user_conn->config_.ca_cert_pem
+        : connector->config_.ca_cert_pem;
+    const size_t ca_pem_len = conn_has_ca
+        ? user_conn->config_.ca_cert_pem_len
+        : connector->config_.ca_cert_pem_len;
+    cfg.caCertsPem.assign(ca_pem ? ca_pem : "", ca_pem ? ca_pem_len : 0);
+    cfg.loggerCtx = connector->logger_ctx_;
+
+    std::string err;
+    BCRESULT verify_result = TlsContext::VerifyChain(
+        chain, host ? std::string(host) : std::string(), cfg, err);
+
+    int result = (verify_result == BC_R_SUCCESS) ? 0 : -1;
+    if (result != 0) {
+        user_conn->cert_verify_error_ = err;
+        LogQ(connector->logger_ctx_, _ERROR_, "cert verify: %s", err.c_str());
+
+        // 保留失败时的完整诊断：leaf + 中间证书链 subject/issuer，以及
+        // 本地信任 CA 列表——对现场排查很关键，逐字保留自迁移前。
+        X509* leaf = chain[0];
+        char subj_buf[256] = {0};
+        char issuer_buf[256] = {0};
+        X509_NAME_oneline(X509_get_subject_name(leaf), subj_buf, sizeof(subj_buf));
+        X509_NAME_oneline(X509_get_issuer_name(leaf), issuer_buf, sizeof(issuer_buf));
+        LogQ(connector->logger_ctx_, _ERROR_,
+            "cert verify: server leaf cert subject=%s, issuer=%s", subj_buf, issuer_buf);
+        for (size_t i = 1; i < chain.size(); ++i) {
+            X509* ic = chain[i];
+            char ic_subj[256] = {0};
+            char ic_issuer[256] = {0};
+            X509_NAME_oneline(X509_get_subject_name(ic), ic_subj, sizeof(ic_subj));
+            X509_NAME_oneline(X509_get_issuer_name(ic), ic_issuer, sizeof(ic_issuer));
+            LogQ(connector->logger_ctx_, _ERROR_,
+                "cert verify: chain[%zu] subject=%s, issuer=%s", i - 1, ic_subj, ic_issuer);
+        }
+        LogQ(connector->logger_ctx_, _ERROR_,
+            "cert verify: local trusted CA count=%zu", trusted_cas->size());
+        for (size_t i = 0; i < trusted_cas->size(); ++i) {
+            X509* ca_cert = (*trusted_cas)[i];
+            if (!ca_cert) {
+                continue;
+            }
+            char ca_subj[256] = {0};
+            char ca_issuer[256] = {0};
+            X509_NAME_oneline(X509_get_subject_name(ca_cert), ca_subj, sizeof(ca_subj));
+            X509_NAME_oneline(X509_get_issuer_name(ca_cert), ca_issuer, sizeof(ca_issuer));
+            LogQ(connector->logger_ctx_, _ERROR_,
+                "cert verify: trusted_ca[%zu] subject=%s, issuer=%s",
+                i, ca_subj, ca_issuer);
+        }
+    }
+
+    freeCertVector(chain);
     return result;
 }
 

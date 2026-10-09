@@ -13,6 +13,27 @@
 // "is the internet"; this one asks about a specific host so we can sanity
 // check whether the IP_UNICAST_IF hint we're about to apply actually
 // agrees with the real outgoing interface for the peer.
+//
+// ⚠️ scope_ifindex 在 Linux 上被**刻意忽略**，查询始终针对全局路由表。
+//
+// netlink 本来提供了等价物：给 RTM_GETROUTE 请求带一个 RTA_OIF 属性，内核
+// 就会按"从这块网卡发"去做 FIB 查询，效果与 macOS 的 RTF_IFSCOPE 相同。
+// 之所以不用，是因为 Linux 上的"绑网卡"未必是硬绑：
+//
+//   * SocketPinner 在 force-physical 下优先 SO_BINDTODEVICE（硬绑，内核会
+//     按 oif 重做 FIB 查询），但该选项需要 CAP_NET_RAW / root；
+//   * 拿不到权限时它会回落到 IP_UNICAST_IF 并**照样返回 TT_PIN_OK**。
+//     IP_UNICAST_IF 只是软提示，内核完全可以把包交给默认路由——也就是
+//     VPN 隧道。
+//
+// 调用方（TcpChannel::_RouteRecheck）拿到的只是"绑上了"，它无法保证拿到的
+// 是硬绑还是软提示。如果这里按 RTA_OIF 做 scoped 查询，软提示那一路会得到
+// "一致"的答复，force-physical 就会放行一条实际走 VPN 的连接——正是这套
+// 复核存在的意义所在。非 scoped 查询在这里是"失败关闭"的那一侧：最坏情况
+// 是多报一次不一致，而不是漏掉一次真的钻进隧道。
+//
+// 等哪天 SocketPinner 把"实际用了哪种手段"回传到复核点，这里可以改成
+// "SO_BINDTODEVICE ⇒ 走 RTA_OIF scoped 查询，IP_UNICAST_IF ⇒ 维持全局查询"。
 ///////////////////////////////////////////////////////////////////////////////
 
 #include "../NetworkRouteLookup.h"
@@ -44,8 +65,12 @@ inline size_t nlmsg_align(size_t n)
 }  // namespace
 
 extern "C" uint32_t tt_route_lookup_ifindex(const struct sockaddr* dst,
-                                            socklen_t dst_len)
+                                            socklen_t dst_len,
+                                            uint32_t scope_ifindex)
 {
+    // 见文件头：Linux 刻意不做 scoped 查询。
+    (void)scope_ifindex;
+
     if (dst == nullptr || dst_len == 0)
     {
         return 0;
@@ -174,9 +199,10 @@ extern "C" uint32_t tt_route_lookup_ifindex(const struct sockaddr* dst,
 #else  // !(Linux non-Android)
 
 extern "C" uint32_t tt_route_lookup_ifindex(const struct sockaddr* /*dst*/,
-                                            socklen_t /*dst_len*/)
+                                            socklen_t /*dst_len*/,
+                                            uint32_t /*scope_ifindex*/)
 {
-    return 0;
+    return TT_ROUTE_IFINDEX_UNKNOWN;
 }
 
 #endif  // Linux non-Android

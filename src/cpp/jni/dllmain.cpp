@@ -15,6 +15,7 @@
 #include "JNI_SMPConnectorWrap.h"
 #include "JNI_SMPServerWrap.h"
 #include "JNI_SMPacketWrap.h"
+#include "JNI_HttpConnectorWrap.h"
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -56,6 +57,7 @@ jint JNI_OnLoad(JavaVM* vm, void* reserved)
 	// JNI::SMPServerWrap::Initialize(env);
 	// JNI::SMPServerConnectionWrap::Initialize(env);
 	JNI::SMPacketWrap::Initialize(env);
+	JNI::HttpConnectorWrap::Initialize(env);
 
 	return JNI_VERSION_1_6;
 }

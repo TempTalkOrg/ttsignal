@@ -31,3 +31,8 @@ High-performance messaging module over QUIC/WebSocket/WSS with multiple network 
 ## Notes
 * 1. The JNI layer uses multithreading; callbacks may be invoked from multiple threads. Ensure thread safety on the Java side;
 * 2. Do not use the connection object after calling conn.close() to close the connection.
+
+## Docs
+
+* [多 ALPN 使用示例](docs/multi-alpn-usage.md)
+* [vpnPolicy：控制 QUIC 是否走 VPN 虚拟网卡](docs/vpn-policy.md) — 含 **Windows 默认行为变更**说明

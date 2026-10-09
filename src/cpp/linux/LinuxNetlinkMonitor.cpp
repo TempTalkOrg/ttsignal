@@ -25,6 +25,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 
 #include "LinuxNetlinkMonitor.h"
+#include "LinuxPhysicalIface.h"
 
 #if !defined(__linux__)
 #  error "LinuxNetlinkMonitor is Linux-only."
@@ -73,35 +74,17 @@ struct Monitor {
     // actually move us off the current network.
     std::mutex           sig_mutex;
     std::string          last_signature;          // guarded by sig_mutex
+
+    // 生效策略。由 tt_netmon_start 从 options->vpnPolicy 与 options->bypassVpn
+    // 合并得出，必须在 worker 线程启动前赋值，之后不再变更。
+    TTVpnPolicy          policy = TT_VPN_POLICY_PREFER_PHYSICAL;
 };
 
-// Names that should never be considered the "real" default interface.
-// Match by prefix (lo / docker / etc.) — everything else is real.
-static bool IsVirtualIface(const char* name)
-{
-    if (!name || !name[0]) return true;
-    static const char* const kBlacklist[] = {
-        "lo",        // loopback
-        "docker",    // docker0, docker_gwbridge
-        "br-",       // docker bridge networks
-        "veth",      // virtual eth between container and host
-        "virbr",     // libvirt
-        "vmnet",     // VMware host-only
-        "tailscale", // tailscale0
-        "tun",       // tun0..N (OpenVPN/WireGuard)
-        "tap",       // tap0..N
-        "zt",        // zerotier
-        "kube-",     // kube-bridge variants
-        "cni",       // cni0
-        "flannel",   // flannel.1
-        nullptr,
-    };
-    for (int i = 0; kBlacklist[i]; ++i) {
-        size_t n = strlen(kBlacklist[i]);
-        if (strncmp(name, kBlacklist[i], n) == 0) return true;
-    }
-    return false;
-}
+// 原先这里有一个 IsVirtualIface 名字前缀黑名单，且无条件生效。判定逻辑已
+// 整体迁移到 LinuxPhysicalIface.cpp：主依据换成
+// /sys/class/net/<name>/device 是否存在（用户可以把物理网卡改名叫 tun0，
+// 名字判断不可靠），同一份黑名单降级为 sysfs 不可读时的兜底。
+// 是否启用过滤现在由 TTVpnPolicy 决定，见 QueryDefaultIfIndex。
 
 // Issue a single RTM_GETROUTE for the unspecified destination (0.0.0.0/0
 // or ::/0) and walk the multipart reply looking for an RTA_OIF attribute.
@@ -117,7 +100,7 @@ static bool IsVirtualIface(const char* name)
 // invocation. SOCK_NONBLOCK + poll(timeout) keeps that bounded; if the
 // query times out we just return 0 and let the netlink event reader
 // pick up the route on the next genuine RTM_NEWROUTE / RTM_DELROUTE.
-static int64_t QueryDefaultIfIndex(int family)
+static int64_t QueryDefaultIfIndex(int family, TTVpnPolicy policy)
 {
     int sock = socket(AF_NETLINK,
                       SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
@@ -143,6 +126,10 @@ static int64_t QueryDefaultIfIndex(int family)
 
     char buf[8192];
     int64_t found = 0;
+    // prefer 档专用：第一块被过滤掉的虚拟网卡默认路由。找不到任何物理
+    // 网卡时回落到它——否则纯 VPN 机器会拿到 0，socket 完全不绑定，
+    // 反而白白把包交给内核路由送进隧道。force 档不用它。
+    int64_t fallback = 0;
     bool timed_out = false;
 
     // Wall-clock budget. Each poll() iteration is at most the remainder
@@ -202,7 +189,15 @@ static int64_t QueryDefaultIfIndex(int family)
                     int oif = *(int*)RTA_DATA(attr);
                     char name[IF_NAMESIZE] = {0};
                     if_indextoname(oif, name);
-                    if (IsVirtualIface(name)) continue;
+                    // os 档不过滤：内核选出的默认路由赢家是谁就是谁，
+                    // 含 tun / wireguard / tailscale。
+                    // prefer / force 两档跳过虚拟网卡，继续在后续的
+                    // RTM_NEWROUTE 里找物理网卡的默认路由。
+                    if (policy != TT_VPN_POLICY_OS &&
+                        !tt_linux_iface_is_physical(name)) {
+                        if (fallback == 0) fallback = (int64_t)oif;
+                        continue;
+                    }
                     found = (int64_t)oif;
                     goto done;
                 }
@@ -225,6 +220,11 @@ done:
             "treating as 'no default route yet'. Common on WSL2.\n",
             family);
         fflush(stderr);
+    }
+    if (found == 0 && policy == TT_VPN_POLICY_PREFER_PHYSICAL) {
+        // 只有 prefer 档回落到隧道。force 档宁可返回 0，让
+        // SMPConnection::Connect 以 BC_R_NO_PHYSICAL_INTERFACE 明确失败。
+        found = fallback;
     }
     return found;
 }
@@ -336,8 +336,8 @@ static void ReaderLoop(Monitor* self)
         }
         last_event_time = std::chrono::steady_clock::now();
 
-        int64_t idx = QueryDefaultIfIndex(AF_INET);
-        if (idx <= 0) idx = QueryDefaultIfIndex(AF_INET6);
+        int64_t idx = QueryDefaultIfIndex(AF_INET, self->policy);
+        if (idx <= 0) idx = QueryDefaultIfIndex(AF_INET6, self->policy);
         if (idx <= 0) continue; // no default route right now
 
         char name[IF_NAMESIZE] = {0};
@@ -367,16 +367,27 @@ TTNetworkMonitorRef tt_netmon_start(const TTNetworkMonitorOptions* options,
                                     TTPathChangeCallback cb,
                                     void* userdata)
 {
-    // Linux netlink picks the active default route by destination metric, not
-    // by interface type, and openvpn/wireguard tun devices win or lose that
-    // race the same way physical interfaces do — so the bypassVpn knob has
-    // no straightforward analogue here. Accept the option for ABI parity and
-    // ignore it. Same applies on Windows.
-    (void)options;
     if (!cb) return nullptr;
     Monitor* self = new Monitor();
     self->callback = cb;
     self->userdata = userdata;
+    // 生效策略由 vpnPolicy / bypassVpn 合并得出。
+    //
+    // ⚠️ 必须在 worker 线程启动之前赋值——WorkerLoop 会读 self->policy。
+    //
+    // Linux 在本次改动前的默认行为已经等价于 prefer-physical：
+    // QueryDefaultIfIndex 里的 IsVirtualIface 是无条件生效的名字黑名单，
+    // 找不到物理网卡的默认路由就返回 0。所以默认值不变；新增的能力是
+    // os 档（不过滤，跟随内核选出的默认路由，含 tun/wireguard）。
+    if (options == nullptr) {
+        self->policy = tt_vpn_policy_platform_default();
+    } else {
+        self->policy = tt_vpn_policy_resolve(
+            (TTVpnPolicy)options->vpnPolicy,
+            /*hasBypassVpn=*/1, options->bypassVpn,
+            tt_vpn_policy_platform_default(),
+            /*outBothGiven=*/nullptr);
+    }
 
     self->netlink_fd = socket(AF_NETLINK,
                               SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
@@ -405,8 +416,8 @@ TTNetworkMonitorRef tt_netmon_start(const TTNetworkMonitorOptions* options,
 
     // Fire initial callback synchronously so the caller learns the
     // current default-route ifIndex before connect().
-    int64_t init_ifx = QueryDefaultIfIndex(AF_INET);
-    if (init_ifx <= 0) init_ifx = QueryDefaultIfIndex(AF_INET6);
+    int64_t init_ifx = QueryDefaultIfIndex(AF_INET, self->policy);
+    if (init_ifx <= 0) init_ifx = QueryDefaultIfIndex(AF_INET6, self->policy);
     if (init_ifx > 0) {
         char name[IF_NAMESIZE] = {0};
         if_indextoname((unsigned)init_ifx, name);
@@ -441,11 +452,23 @@ void tt_netmon_stop(TTNetworkMonitorRef ref)
     delete self;
 }
 
+int64_t tt_netmon_query_default_ifindex_ex(int vpnPolicy)
+{
+    TTVpnPolicy policy = (TTVpnPolicy)vpnPolicy;
+    if (policy != TT_VPN_POLICY_OS &&
+        policy != TT_VPN_POLICY_PREFER_PHYSICAL &&
+        policy != TT_VPN_POLICY_FORCE_PHYSICAL) {
+        policy = tt_vpn_policy_platform_default();
+    }
+    int64_t idx = QueryDefaultIfIndex(AF_INET, policy);
+    if (idx <= 0) idx = QueryDefaultIfIndex(AF_INET6, policy);
+    return idx;
+}
+
 int64_t tt_netmon_query_default_ifindex(void)
 {
-    int64_t idx = QueryDefaultIfIndex(AF_INET);
-    if (idx <= 0) idx = QueryDefaultIfIndex(AF_INET6);
-    return idx;
+    return tt_netmon_query_default_ifindex_ex(
+        (int)tt_vpn_policy_platform_default());
 }
 
 } // extern "C"

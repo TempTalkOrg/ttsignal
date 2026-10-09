@@ -2,7 +2,7 @@
 # ============================================================================
 # ios/scripts/build-deps.sh
 #
-# Compile boringssl + jquic + env as static libraries for the three iOS
+# Compile boringssl + jquic + env + llhttp as static libraries for the three iOS
 # slices we ship in the xcframework:
 #   - iphoneos / arm64           (real device)
 #   - iphonesimulator / arm64    (Apple-silicon Mac simulator)
@@ -13,6 +13,7 @@
 #   build/ios-deps/<sdk>-<arch>/lib/libcrypto.a
 #   build/ios-deps/<sdk>-<arch>/lib/libjquic.a
 #   build/ios-deps/<sdk>-<arch>/lib/libenv.a
+#   build/ios-deps/<sdk>-<arch>/lib/libllhttp.a
 #
 # Each underlying CMake project also writes to
 #   deps/<lib>/lib/iOS/<arch>/Release/lib*.a
@@ -151,6 +152,23 @@ build_one_slice() {
     cmake --build "${jquic_build}" --target jquic -j "${JOBS}"
     cp -f "${REPO_ROOT}/deps/jquic/lib/iOS/${arch}/Release/libjquic.a" "${lib_dir}/libjquic.a"
 
+    # ----- llhttp --------------------------------------------------
+    # HTTP 报文解析，HttpConnector / LLHTTPParser / WSConnector / WSParser 要用。
+    # 纯 C，三个 .c 文件，无外部依赖 —— 写法与上面的 env 一样简单。
+    # 在此之前 iOS 侧没有这个库，src/CMakeLists.txt 只能把那四个 .cpp
+    # REMOVE_ITEM 掉，于是 iOS 产物没有 HTTP/WS 能力；补上它就能对齐
+    # Android / Node 的能力面。
+    local llhttp_build="${stage}/llhttp-build"
+    mkdir -p "${llhttp_build}"
+    cmake -S "${REPO_ROOT}/deps/llhttp/src" -B "${llhttp_build}" \
+        -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN}" \
+        -DIOS_PLATFORM="${platform}" \
+        -DIOS_DEPLOYMENT_TARGET="${DEPLOYMENT_TARGET}" \
+        -DCMAKE_BUILD_TYPE=Release
+    force_relink "${REPO_ROOT}/deps/llhttp/lib/iOS/${arch}/Release/libllhttp.a"
+    cmake --build "${llhttp_build}" --target llhttp -j "${JOBS}"
+    cp -f "${REPO_ROOT}/deps/llhttp/lib/iOS/${arch}/Release/libllhttp.a" "${lib_dir}/libllhttp.a"
+
     # Sanity: verify each archive in the stable per-slice tree was actually
     # built for the platform we asked for. Catches regressions where a
     # future `cmake --build` change re-introduces the cross-pollution
@@ -163,7 +181,7 @@ build_one_slice() {
         iphonesimulator) expected_platform=7 ;;
         *) echo "[ios-deps] unknown sdk '${sdk}'" >&2; exit 1 ;;
     esac
-    for a in libssl.a libcrypto.a libjquic.a libenv.a; do
+    for a in libssl.a libcrypto.a libjquic.a libenv.a libllhttp.a; do
         verify_platform "${lib_dir}/${a}" "${expected_platform}" "${label}/${a}"
     done
 

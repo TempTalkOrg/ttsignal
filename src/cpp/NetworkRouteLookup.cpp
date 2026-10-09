@@ -35,9 +35,10 @@
     !defined(_WIN32)
 
 extern "C" uint32_t tt_route_lookup_ifindex(const struct sockaddr* /*dst*/,
-                                            socklen_t /*dst_len*/)
+                                            socklen_t /*dst_len*/,
+                                            uint32_t /*scope_ifindex*/)
 {
-    return 0;
+    return TT_ROUTE_IFINDEX_UNKNOWN;
 }
 
 #endif

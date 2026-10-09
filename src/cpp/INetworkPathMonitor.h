@@ -22,6 +22,12 @@
 
 #include <stdint.h>
 
+// TTVpnPolicy 与其解析辅助函数。放在独立头文件里是因为 UDPSender 与
+// SMPConnector 也要用这个枚举，但它们并不需要下面的 monitor C API。
+// 从本头文件 include 它，保证"包含 INetworkPathMonitor.h 就能拿到
+// TTVpnPolicy"这个既有契约不变。
+#include "VpnPolicy.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -84,6 +90,23 @@ typedef struct TTNetworkMonitorOptions {
     // to LogQ / NSLog / fprintf as-is.
     TTPathLogCallback rawLogFn;
     void* rawLogCtx;
+    // 三态 VPN / 虚拟网卡策略，取值见 TTVpnPolicy。取代上面的 bypassVpn，
+    // 后者保留但已废弃。语义（三平台一致）：
+    //
+    //   TT_VPN_POLICY_OS (0)
+    //       完全跟随系统路由，允许把 QUIC 弹到 VPN 隧道上。
+    //   TT_VPN_POLICY_PREFER_PHYSICAL (1)
+    //       优先物理网卡。启动查询找不到物理网卡时可回落隧道（VPN-only 机器
+    //       还得能 bootstrap），运行中则拒绝回落、保持当前 socket。
+    //   TT_VPN_POLICY_FORCE_PHYSICAL (2)
+    //       只接受物理网卡，任何阶段都不回落。
+    //
+    // ⚠️ TT_VPN_POLICY_UNSET 是 -1 而不是 0。C-struct 零初始化会把本字段填成
+    // 0，也就是 TT_VPN_POLICY_OS——那跟"未设置"不是一回事。所有调用方在填充
+    // options 时必须显式赋值；实现侧只有在读到 -1 时才回落到 bypassVpn 的
+    // 兼容映射与平台默认值。SMPConnector 已经显式赋值（见 SMPConnector.cpp
+    // 里的 tt_netmon_start 调用）。
+    int vpnPolicy;
 } TTNetworkMonitorOptions;
 
 // Allocate + start a monitor. Returns NULL on failure (out of memory,
@@ -91,10 +114,11 @@ typedef struct TTNetworkMonitorOptions {
 // before this function returns (with the current initial path), so callers
 // must be ready to receive callbacks immediately.
 //
-// `options` may be NULL — implementations then fall back to their hardcoded
-// defaults (currently: bypassVpn = 1 on macOS, no effect elsewhere). Passing
-// a non-NULL pointer lets callers override per-instance; the struct is
-// copied internally so the caller may free it as soon as this call returns.
+// `options` may be NULL — implementations then fall back to
+// tt_vpn_policy_platform_default() (prefer-physical on macOS / Windows /
+// Linux, os on iOS). Passing a non-NULL pointer lets callers override
+// per-instance; the struct is copied internally so the caller may free it as
+// soon as this call returns.
 //
 // Implementations MUST de-duplicate on ifIndex (don't fire when the active
 // interface didn't actually change — Linux netlink is especially noisy
@@ -114,6 +138,19 @@ void tt_netmon_stop(TTNetworkMonitorRef ref);
 // callback. It is OK if this returns 0 — UDPSender just won't bind, and
 // the first callback will fix things up.
 int64_t tt_netmon_query_default_ifindex(void);
+
+// 同 tt_netmon_query_default_ifindex，但显式指定策略（取值见 TTVpnPolicy）。
+//
+//   TT_VPN_POLICY_OS              — 返回系统默认路由的出口网卡，含 VPN 隧道
+//   TT_VPN_POLICY_PREFER_PHYSICAL — 优先物理网卡，没有物理网卡时回落隧道
+//   TT_VPN_POLICY_FORCE_PHYSICAL  — 只返回物理网卡，没有则返回 0
+//
+// 无法识别的取值按 tt_vpn_policy_platform_default() 处理。
+//
+// 为什么是个新函数而不是给原函数加参数：tt_netmon_query_default_ifindex 是
+// 已发布的导出符号（见 ios/SYMBOL_COLLISION_FIX_REPORT.md 的符号表），改签名
+// 会破坏 ABI。原函数保留为"传平台默认策略"的薄包装。
+int64_t tt_netmon_query_default_ifindex_ex(int vpnPolicy);
 
 #ifdef __cplusplus
 } // extern "C"

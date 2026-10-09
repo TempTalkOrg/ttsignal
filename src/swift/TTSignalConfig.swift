@@ -10,6 +10,28 @@
 import Foundation
 import TTSignalC
 
+/// VPN / 虚拟网卡选择策略。取代已废弃的 `TTSignalConfig.bypassVpn`。
+///
+/// rawValue 与 C 侧 `TTConfig.vpnPolicy` / `TTVpnPolicy` 一一对应，
+/// 是跨 ABI 契约的一部分，不要改动。
+///
+/// 定义在顶层而非嵌套进 `TTSignalConfig`，与 binding 里其它 `TTSignal*`
+/// 公共类型保持一致的命名风格。
+public enum TTSignalVPNPolicy: Int32 {
+    /// 跟随系统路由，允许 QUIC 流量走 VPN / utun 隧道，不安装任何网卡绑定。
+    /// iOS 的默认值——装了 per-app VPN 的用户通常就是希望流量走 VPN。
+    case os = 0
+    /// 优先物理网卡（wifi / wired / cellular）。启动时找不到物理网卡可回落
+    /// 隧道，运行中拒绝回落（保持当前 socket）。macOS / Windows / Linux 的
+    /// 默认值。
+    case preferPhysical = 1
+    /// 只走物理网卡，任何阶段都不回落，也不撤销已安装的网卡绑定。找不到
+    /// 物理网卡时 `connect` 立即失败并回调
+    /// `BC_R_NO_PHYSICAL_INTERFACE`（64）。用于服务端必须观测到客户端真实
+    /// IP 而非 VPN 出口 IP 的场景。
+    case forcePhysical = 2
+}
+
 public struct TTSignalConfig {
 
     /// Levels match TTSignalLog.Level / Const.LOG_*. Values are the same
@@ -96,17 +118,34 @@ public struct TTSignalConfig {
     /// yourself via `TTSignalConnection.restart(interface:)`.
     public var disableAutoRestart: Bool        = false
 
-    /// macOS-only behaviour switch. Default (`nil`) keeps the
-    /// platform-native default — currently "prefer physical
-    /// interfaces" — which avoids bouncing QUIC onto a VPN/utun
-    /// tunnel while the underlying wifi is in the middle of a
-    /// handover. Set to `false` to let macOS pick whatever the
-    /// active default-route interface is (including VPN tunnels);
-    /// set to `true` to force the same physical-first behaviour
-    /// explicitly. iOS honours the property for API parity but
-    /// always uses the OS preference order, so the value is a no-op
-    /// on iPhone / iPad.
-    public var bypassVpn: Bool?                = nil
+    /// VPN / 虚拟网卡选择策略。`nil` 表示用平台默认值（iOS 上是 `.os`，
+    /// macOS / Windows / Linux 上是 `.preferPhysical`）。
+    ///
+    /// 与已废弃的 `bypassVpn` 同时设置时本属性胜出，原生层会打一条警告
+    /// 日志。
+    ///
+    /// 用 `.forcePhysical` 时，如果当前没有可用物理网卡，`connect` 会
+    /// 立即失败并通过 `TTSignalHandler.onConnectResult` 回调
+    /// `BC_R_NO_PHYSICAL_INTERFACE`（64），不会等到超时。
+    public var vpnPolicy: TTSignalVPNPolicy?   = nil
+
+    /// 【已废弃】改用 `vpnPolicy`。
+    ///
+    /// 兼容映射：`false` → `.os`，`true` → `.preferPhysical`。
+    ///
+    /// 历史说明：这个开关此前只在 macOS 生效，iOS 上完全是空操作
+    /// （`ResolveActiveIfIndex` 直接忽略它，取系统顺序第一块网卡）。
+    /// 现在两个平台共用同一份实现，差别只体现在默认值上。
+    @available(*, deprecated, message: "改用 vpnPolicy。false 等价于 .os，true 等价于 .preferPhysical")
+    public var bypassVpn: Bool? {
+        get { _bypassVpn }
+        set { _bypassVpn = newValue }
+    }
+
+    /// `bypassVpn` 的实际存储。做成独立的非废弃属性，是为了让 binding 内部
+    /// （withCConfig）能读它而不触发自身的废弃警告；调用方走公开的
+    /// `bypassVpn` 时仍会正常收到废弃提示。
+    internal var _bypassVpn: Bool?             = nil
 
     public init() {}
 
@@ -159,7 +198,13 @@ public struct TTSignalConfig {
         // -1 sentinel = "use platform default" (see TTConfig.bypassVpn
         // doc in ios_bridge.h). Only flip to 0/1 when the app has
         // actually expressed a preference.
-        c.bypassVpn                = bypassVpn.map { $0 ? Int32(1) : Int32(0) } ?? Int32(-1)
+        //
+        // bypassVpn 已废弃但仍然透传：原生层在两者都给出时以 vpnPolicy 为准
+        // 并打 WARN，只给 bypassVpn 时走兼容映射。读内部存储 _bypassVpn 而非
+        // 公开属性，避免 binding 自身产生废弃警告。
+        c.bypassVpn                = _bypassVpn.map { $0 ? Int32(1) : Int32(0) } ?? Int32(-1)
+        // 同样用 -1 表示未设置，让原生层回落到 bypassVpn 兼容映射 / 平台默认。
+        c.vpnPolicy                = vpnPolicy?.rawValue ?? Int32(-1)
 
         return withUnsafePointer(to: &c) { body($0) }
     }

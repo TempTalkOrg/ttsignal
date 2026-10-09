@@ -71,7 +71,8 @@ BCRESULT UDPSenderGroup::Create(
     BCFObject *pConfig,
     IUDPSenderHandler *pHandler,
     bool bindIP,
-    bool bindPort)
+    bool bindPort,
+    int64_t initialNetworkHandle)
 {
     if (!pTaskMgr || !pTimerMgr || !pSockMgr || !pConfig || !pHandler)
     {
@@ -96,7 +97,7 @@ BCRESULT UDPSenderGroup::Create(
 
         BCRESULT r = sender->Create(logger_ctx, pTaskMgr, pTimerMgr,
                                     pSockMgr, pConfig, handler,
-                                    bindIP, bindPort);
+                                    bindIP, bindPort, initialNetworkHandle);
         if (r != BC_R_SUCCESS)
         {
             delete handler;
@@ -184,6 +185,19 @@ BCRESULT UDPSenderGroup::GetSockName(BCSockAddrS& refAddr)
         return senders_[0].sender->GetSockName(refAddr);
     }
     return BC_R_FAILURE;
+}
+
+void UDPSenderGroup::SetVpnPolicy(TTVpnPolicy policy)
+{
+    // 组内所有 sender 一视同仁：它们各自持有独立 socket，但共享同一条连接
+    // 的策略语义。converged_ 之前每个 sender 都可能成为 winner。
+    for (auto& entry : senders_)
+    {
+        if (entry.sender)
+        {
+            entry.sender->SetVpnPolicy(policy);
+        }
+    }
 }
 
 void UDPSenderGroup::Close()

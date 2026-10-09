@@ -120,6 +120,16 @@ static BCFObject* ConvertConfig(const TTConfig* cfg)
     if (cfg->bypassVpn == 0 || cfg->bypassVpn == 1) {
         p->PutBool("bypassVpn",               BoolField(cfg->bypassVpn));
     }
+    // vpnPolicy 同理用 -1 表示未设置：不写这个键，让
+    // SMPConnector::Config::Init 走 bypassVpn 兼容映射 / 平台默认值的回落
+    // 链路。原生层按字符串解析，所以这里转成字符串写入。
+    //
+    // 越界值会被 tt_vpn_policy_to_string 转成 "invalid"，原生层解析时告警
+    // 并回落平台默认——这是期望行为，不在这里额外校验。
+    if (cfg->vpnPolicy >= 0) {
+        p->PutString("vpnPolicy",
+                     tt_vpn_policy_to_string((TTVpnPolicy)cfg->vpnPolicy));
+    }
     return p;
 }
 

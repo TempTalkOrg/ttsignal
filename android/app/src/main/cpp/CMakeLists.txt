@@ -34,6 +34,13 @@ endif()
 add_subdirectory(${BASE_DIR}/../../../../../deps/env/src deps/env.dir)
 add_subdirectory(${BASE_DIR}/../../../../../deps/boringssl/src deps/boringssl.dir)
 add_subdirectory(${BASE_DIR}/../../../../../deps/jquic deps/jquic.dir)
+# llhttp：HTTP 报文解析。下面的 JNI_SRC_FILES 用 glob 收 src/cpp/*.cpp，
+# HttpConnector / LLHTTPParser / WSConnector / WSParser 这四个新文件因此自动进来，
+# 它们 #include <llhttp.h> 并调 llhttp_* 符号。少了这一行就是
+#   fatal error: 'llhttp.h' file not found
+# （iOS 走的是另一条路：那边不 add_subdirectory，改用 REMOVE_ITEM 把这四个文件
+#   排除掉，见 src/CMakeLists.txt 里的说明。）
+add_subdirectory(${BASE_DIR}/../../../../../deps/llhttp/src deps/llhttp.dir)
 
 add_definitions(-D__STDC_LIMIT_MACROS -DHAVE_PTHREAD -DCR_USE_FALLBACKS_FOR_GCC_WITH_LIBCXX
         -DNOMINMAX
@@ -78,6 +85,7 @@ include_directories(
         ${BASE_DIR}/../../../../../deps/env/src
         ${BASE_DIR}/../../../../../deps/boringssl/src/include
         ${BASE_DIR}/../../../../../deps/jquic/include
+        ${BASE_DIR}/../../../../../deps/llhttp/include
         ${BASE_DIR}/../../../../../src/cpp
 )
 
@@ -126,6 +134,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
         # List libraries link to the target library
         env
         jquic
+        llhttp
         ssl
         crypto
         android

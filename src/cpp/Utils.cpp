@@ -6,6 +6,7 @@
 #include "StdAfx.h"
 #include <inttypes.h>
 #include "Utils.h"
+#include "TTErrors.h"   // ResultName 用到的 ttsignal 自定义错误码
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
@@ -638,6 +639,82 @@ const char* GetSDKVersion()
 ///////////////////////////////////////////////////////////////////////////////
 // End of namespace : node
 ///////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////////
+// ResultName —— 错误码的符号名
+//
+// 为什么不直接用 bc_result2string：它返回的是人类可读的散文（"invalid
+// arguments" / "timed out"），而且**不认识 ttsignal 自定义的那几个码**
+// （BC_R_ROUTE_MISMATCH / BC_R_WS_HANDSHAKE_FAILED 之类会落到 "out of result
+// range"）—— 那几个恰好是 force-physical 与握手诊断的关键。散文并没有被丢掉：
+// 它在 errMessage 为空时进 message，见各绑定的 _MakeError / _MakeWSError。
+//
+// 表里覆盖的是这些接口实际能产生的码：HTTP / WS / TCP / TLS / DNS 这条栈自己
+// 返回的，加上 bc__errno2result 会映射出来的 socket 错误。表外的码给
+// "BC_R_(<数值>)"，绝不退化成散文 —— 否则 errName 时而是符号、时而是句子，
+// JS 侧没法用。
+//
+// ⚠️ BC_R_NO_PHYSICAL_INTERFACE 的取值 64 来自 deps/env/src/BC/Config.h:388，
+// 是写进 src/js/index.js 与 src/swift/TTSignalConfig.swift 文档的跨语言契约值。
+// 这里只是给它取个名字，**不重新定义取值**。
+//
+// ⚠️ HttpConnector 与 WSConnector 两套绑定共用这一份表，别再各自复制一份 ——
+// 漂移出来的不一致 errName 比没有 errName 更难查。
+///////////////////////////////////////////////////////////////////////////////
+
+std::string ResultName(BCRESULT result)
+{
+#define TT_RESULT_NAME_CASE(x)	case x: return #x;
+	switch (result)
+	{
+	// ttsignal 自定义（src/cpp/TTErrors.h）+ 契约值 64
+	TT_RESULT_NAME_CASE(BC_R_NO_PHYSICAL_INTERFACE)
+	TT_RESULT_NAME_CASE(BC_R_PIN_FAILED)
+	TT_RESULT_NAME_CASE(BC_R_ROUTE_MISMATCH)
+	TT_RESULT_NAME_CASE(BC_R_DNS_FAILED)
+	TT_RESULT_NAME_CASE(BC_R_TLS_VERIFY_FAILED)
+	TT_RESULT_NAME_CASE(BC_R_RESPONSE_TOO_LARGE)
+	// WebSocket 特有：响应不是 101，或 Upgrade / Connection /
+	// Sec-WebSocket-Accept 校验不通过（WSConnector.cpp 的 _Fail 那处）
+	TT_RESULT_NAME_CASE(BC_R_WS_HANDSHAKE_FAILED)
+	TT_RESULT_NAME_CASE(BC_R_IDLE_TIMEOUT)
+	TT_RESULT_NAME_CASE(BC_R_CONNECT_TIMEOUT)
+	// HTTP / WS / TCP / TLS / DNS 这条栈自己会返回的 BC 通用码
+	TT_RESULT_NAME_CASE(BC_R_SUCCESS)
+	TT_RESULT_NAME_CASE(BC_R_FAILURE)
+	TT_RESULT_NAME_CASE(BC_R_INVALIDARG)
+	TT_RESULT_NAME_CASE(BC_R_NOMEMORY)
+	TT_RESULT_NAME_CASE(BC_R_NOTCONNECTED)
+	TT_RESULT_NAME_CASE(BC_R_NOTIMPLEMENTED)
+	TT_RESULT_NAME_CASE(BC_R_SHUTTINGDOWN)
+	TT_RESULT_NAME_CASE(BC_R_ALREADYRUNNING)
+	TT_RESULT_NAME_CASE(BC_R_CANCELED)
+	TT_RESULT_NAME_CASE(BC_R_INPROGRESS)
+	TT_RESULT_NAME_CASE(BC_R_TIMEDOUT)
+	TT_RESULT_NAME_CASE(BC_R_EOF)
+	TT_RESULT_NAME_CASE(BC_R_EXISTS)
+	TT_RESULT_NAME_CASE(BC_R_UNEXPECTED)
+	TT_RESULT_NAME_CASE(BC_R_UNEXPECTEDEND)
+	TT_RESULT_NAME_CASE(BC_R_UNEXPECTEDTOKEN)
+	// bc__errno2result 会映射出来的 socket 错误
+	TT_RESULT_NAME_CASE(BC_R_CONNREFUSED)
+	TT_RESULT_NAME_CASE(BC_R_CONNECTIONRESET)
+	TT_RESULT_NAME_CASE(BC_R_NETUNREACH)
+	TT_RESULT_NAME_CASE(BC_R_NETDOWN)
+	TT_RESULT_NAME_CASE(BC_R_HOSTUNREACH)
+	TT_RESULT_NAME_CASE(BC_R_HOSTDOWN)
+	TT_RESULT_NAME_CASE(BC_R_ADDRNOTAVAIL)
+	TT_RESULT_NAME_CASE(BC_R_NOPERM)
+	TT_RESULT_NAME_CASE(BC_R_NORESOURCES)
+	TT_RESULT_NAME_CASE(BC_R_TOOMANYOPENFILES)
+	TT_RESULT_NAME_CASE(BC_R_IOERROR)
+	TT_RESULT_NAME_CASE(BC_R_FAMILYNOSUPPORT)
+	default:
+		break;
+	}
+#undef TT_RESULT_NAME_CASE
+	return "BC_R_(" + std::to_string((unsigned)result) + ")";
+}
 
 } // End of namespace : node
 

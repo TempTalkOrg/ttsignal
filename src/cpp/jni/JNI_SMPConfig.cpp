@@ -128,6 +128,17 @@ BCFObject *SMPConfig::ConvertFromJava(JNIEnv *env, jobject obj)
 	if (!strValue.empty()) {
 		pConfig->PutString("spki_pin", strValue);
 	}
+	JniUtils::GetStringField(env, obj, cls, "vpnPolicy", strValue);
+	if (!strValue.empty()) {
+		pConfig->PutString("vpnPolicy", strValue);
+	}
+	{
+		jlong androidNetHandle =
+			JniUtils::GetLongField(env, obj, cls, "androidNetHandle");
+		if (androidNetHandle > 0) {
+			pConfig->PutInt("androidNetHandle", androidNetHandle);
+		}
+	}
 	env->DeleteLocalRef(cls);
 	return pConfig;
 }

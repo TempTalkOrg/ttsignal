@@ -80,13 +80,79 @@ struct Monitor {
     std::mutex               mtx;
     std::condition_variable  cv;
     bool                     pending    { false };
+
+    // 生效策略。由 tt_netmon_start 从 options->vpnPolicy 与 options->bypassVpn
+    // 合并得出，必须在 worker 线程启动前赋值，之后不再变更。
+    TTVpnPolicy              policy     = TT_VPN_POLICY_PREFER_PHYSICAL;
 };
+
+// 判断一块网卡是不是真实硬件。
+//
+// 只看 MIB_IF_ROW2::Type 是不够的：TAP-Windows（OpenVPN）和 wintun
+// （WireGuard / Clash / mihomo）都把自己上报成 IF_TYPE_ETHERNET_CSMACD，
+// 光看类型会把它们误判成物理网卡。
+// InterfaceAndOperStatusFlags.HardwareInterface 是 NDIS 给出的"背后有没有
+// 真实硬件"的权威答案，正是我们要的。Type 检查只作为额外的保险。
+static bool IsPhysicalAdapter(NET_IFINDEX ifIndex)
+{
+    MIB_IF_ROW2 row;
+    memset(&row, 0, sizeof(row));
+    row.InterfaceIndex = ifIndex;
+    if (GetIfEntry2(&row) != NO_ERROR) {
+        return false;
+    }
+    if (row.InterfaceAndOperStatusFlags.HardwareInterface == 0) {
+        return false;
+    }
+    switch (row.Type) {
+        case IF_TYPE_TUNNEL:
+        case IF_TYPE_PPP:
+        case IF_TYPE_SOFTWARE_LOOPBACK:
+            return false;
+        default:
+            break;
+    }
+    return true;
+}
+
+// 枚举所有网卡，返回 metric 最小的那块 up 状态物理网卡。没有则返回 0。
+static int64_t QueryBestPhysicalIfIndex()
+{
+    PMIB_IF_TABLE2 table = nullptr;
+    if (GetIfTable2(&table) != NO_ERROR || table == nullptr) {
+        return 0;
+    }
+    int64_t  best       = 0;
+    ULONG    bestMetric = 0xFFFFFFFFu;
+    for (ULONG i = 0; i < table->NumEntries; i++) {
+        const MIB_IF_ROW2& row = table->Table[i];
+        if (row.OperStatus != IfOperStatusUp) continue;
+        if (!IsPhysicalAdapter(row.InterfaceIndex)) continue;
+
+        // MIB_IF_ROW2 没有路由 metric，用接口 metric 近似；两块都可用时
+        // 这个排序跟 Windows 自己挑默认路由的偏好一致。
+        MIB_IPINTERFACE_ROW ipRow;
+        memset(&ipRow, 0, sizeof(ipRow));
+        ipRow.Family         = AF_INET;
+        ipRow.InterfaceIndex = row.InterfaceIndex;
+        ULONG metric = 0xFFFFFFFEu;
+        if (GetIpInterfaceEntry(&ipRow) == NO_ERROR) {
+            metric = ipRow.Metric;
+        }
+        if (best == 0 || metric < bestMetric) {
+            best       = (int64_t)row.InterfaceIndex;
+            bestMetric = metric;
+        }
+    }
+    FreeMibTable(table);
+    return best;
+}
 
 // GetBestInterfaceEx wants a sockaddr destination. Using INADDR_ANY (0.0.0.0)
 // asks Windows for the best interface to reach an unspecified IPv4 dest,
 // which is effectively "give me the default-route interface". We try IPv4
 // first; if that fails we try the IPv6 unspecified address.
-static int64_t QueryBestIfIndex()
+static int64_t QueryBestIfIndexOsOrder()
 {
     struct sockaddr_in dst4 = {};
     dst4.sin_family = AF_INET;
@@ -104,6 +170,28 @@ static int64_t QueryBestIfIndex()
         return (int64_t)ifx;
     }
     return 0;
+}
+
+// policy 语义与 AppleNetworkMonitor.mm 的 ResolveActiveIfIndex 一致：
+//   os              — 系统默认路由赢家，含 TUN
+//   prefer-physical — 默认路由赢家若本身就是物理网卡则直接用（快路径，覆盖
+//                     绝大多数无 VPN 场景）；否则枚举物理网卡取 metric 最小
+//                     者；再没有才回落到默认路由赢家
+//   force-physical  — 同上，但最后一步不回落，返回 0
+static int64_t QueryBestIfIndex(TTVpnPolicy policy)
+{
+    const int64_t osBest = QueryBestIfIndexOsOrder();
+    if (policy == TT_VPN_POLICY_OS) {
+        return osBest;
+    }
+    if (osBest > 0 && IsPhysicalAdapter((NET_IFINDEX)osBest)) {
+        return osBest;
+    }
+    const int64_t phys = QueryBestPhysicalIfIndex();
+    if (phys > 0) {
+        return phys;
+    }
+    return (policy == TT_VPN_POLICY_FORCE_PHYSICAL) ? 0 : osBest;
 }
 
 // Walk GetUnicastIpAddressTable() and collect every non-loopback IPv4/IPv6
@@ -203,7 +291,7 @@ static void WorkerLoop(Monitor* self)
         }
         if (self->stop.load()) return;
 
-        int64_t ifx = QueryBestIfIndex();
+        int64_t ifx = QueryBestIfIndex(self->policy);
         if (ifx <= 0) continue;
 
         std::string sig = MakeSignature(ifx, CollectInterfaceIPs(ifx));
@@ -243,21 +331,32 @@ TTNetworkMonitorRef tt_netmon_start(const TTNetworkMonitorOptions* options,
                                     TTPathChangeCallback cb,
                                     void* userdata)
 {
-    // bypassVpn intentionally ignored — see LinuxNetlinkMonitor.cpp for the
-    // reasoning. NotifyIpInterfaceChange tells us "the default route
-    // changed", not "what kind of media won", so there is no clean way to
-    // filter tunnels here without inspecting the IP_ADAPTER_ADDRESSES_LH
-    // tunnel flag — overkill for desktop server use.
-    (void)options;
     if (!cb) return nullptr;
     Monitor* self = new Monitor();
     self->callback = cb;
     self->userdata = userdata;
+    // 生效策略由 vpnPolicy / bypassVpn 合并得出。
+    //
+    // ⚠️ 必须在 worker 线程启动之前赋值——WorkerLoop 会读 self->policy。
+    //
+    // Windows 在本次改动前实际等价于 os：GetBestInterfaceEx 不做任何接口
+    // 类型过滤，TUN 抢了默认路由就选 TUN。改动后默认对齐桌面其它平台的
+    // prefer-physical，这是有意引入的默认行为变更，详见
+    // docs/superpowers/specs/2026-08-03-vpn-policy-design.md。
+    if (options == nullptr) {
+        self->policy = tt_vpn_policy_platform_default();
+    } else {
+        self->policy = tt_vpn_policy_resolve(
+            (TTVpnPolicy)options->vpnPolicy,
+            /*hasBypassVpn=*/1, options->bypassVpn,
+            tt_vpn_policy_platform_default(),
+            /*outBothGiven=*/nullptr);
+    }
     self->worker   = std::thread(WorkerLoop, self);
 
     // Initial fire so the caller sees the current default-route ifx
     // before connect().
-    int64_t init = QueryBestIfIndex();
+    int64_t init = QueryBestIfIndex(self->policy);
     if (init > 0) {
         {
             std::lock_guard<std::mutex> lock(self->sig_mtx);
@@ -296,9 +395,21 @@ void tt_netmon_stop(TTNetworkMonitorRef ref)
     delete self;
 }
 
+int64_t tt_netmon_query_default_ifindex_ex(int vpnPolicy)
+{
+    TTVpnPolicy policy = (TTVpnPolicy)vpnPolicy;
+    if (policy != TT_VPN_POLICY_OS &&
+        policy != TT_VPN_POLICY_PREFER_PHYSICAL &&
+        policy != TT_VPN_POLICY_FORCE_PHYSICAL) {
+        policy = tt_vpn_policy_platform_default();
+    }
+    return QueryBestIfIndex(policy);
+}
+
 int64_t tt_netmon_query_default_ifindex(void)
 {
-    return QueryBestIfIndex();
+    return tt_netmon_query_default_ifindex_ex(
+        (int)tt_vpn_policy_platform_default());
 }
 
 } // extern "C"

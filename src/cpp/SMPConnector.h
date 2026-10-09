@@ -14,6 +14,9 @@
 #include "SMPParser.h"
 #include "Utils.h"
 #include "SMPacket.h"
+// TTVpnPolicy 无条件引入：Config::vpn_policy 在所有平台都存在（含不带路径
+// 监视器的 Android JNI 构建），而 VpnPolicy.h 本身零平台依赖。
+#include "VpnPolicy.h"
 #if defined(TT_HAS_PATH_MONITOR)
 #include "INetworkPathMonitor.h"
 #endif
@@ -204,6 +207,8 @@ class SMPConnection
         uint8_t                     cid_tag[SMP_CID_TAG_LEN];
         LPCSTR                      ca_cert_pem;
         size_t                      ca_cert_pem_len;
+        TTVpnPolicy                 vpn_policy;
+        uint64_t                    android_net_handle;
         TTProxyType   proxy_type;
         LPCSTR        proxy_host;
         uint16_t      proxy_port;
@@ -456,6 +461,9 @@ class SMPConnector
             , ca_cert_pem(NULL), ca_cert_pem_len(0)
             , disableAutoRestart(false)
             , bypassVpn(true)
+            , vpn_policy(TT_VPN_POLICY_UNSET)
+            , vpn_policy_both_given(false)
+            , vpn_policy_bad_string(NULL)
             , proxy_type(TT_PROXY_NONE), proxy_host(NULL), proxy_port(0)
             , proxy_sni(NULL), proxy_url(NULL)
         {
@@ -490,15 +498,26 @@ class SMPConnector
         // ship a monitor; ignored entirely on Android (Java NetworkCallback
         // path is independent). Set true for long-lived server deployments.
         bool                        disableAutoRestart;
-        // macOS-only behaviour switch surfaced through
-        // TTNetworkMonitorOptions::bypassVpn. Default true: keep QUIC on
-        // physical interfaces (wifi / wired / cellular) even when a
-        // utun / ipsec tunnel briefly wins the default route. Set false
-        // for apps that explicitly want to ride a VPN tunnel. iOS, Linux
-        // and Windows monitors honour the flag for ABI parity but ignore
-        // its value — see TTNetworkMonitorOptions in
-        // INetworkPathMonitor.h.
+        // 【已废弃】改用下面的 vpn_policy。保留是为了兼容既有调用方：
+        // Config::Init 读到 "bypassVpn" 键时会做 false -> os、
+        // true -> prefer-physical 的映射。两个键同时出现时 vpnPolicy 胜出。
         bool                        bypassVpn;
+        // 三态 VPN / 虚拟网卡策略。Config::Init 里由 "vpnPolicy" 字符串键与
+        // 旧的 "bypassVpn" 布尔键合并得出，永远是 OS / PREFER_PHYSICAL /
+        // FORCE_PHYSICAL 三者之一（不会是 UNSET）。语义见 VpnPolicy.h。
+        //
+        // 消费方有三处：tt_netmon_start（选哪块网卡）、UDPSender（是否允许
+        // 撤销网卡绑定）、SMPConnection::Connect（force 档无物理网卡时快速
+        // 失败）。
+        TTVpnPolicy                 vpn_policy;
+        // 下面两个纯粹是给 SMPConnector::Create 打告警用的诊断位——
+        // Config::Init 没有 logger context，只能把"发现了什么"记下来，
+        // 由 Create 在 config_.Init 之后统一打日志。
+        //
+        // vpnPolicy 与 bypassVpn 同时出现（后者被忽略）
+        bool                        vpn_policy_both_given;
+        // vpnPolicy 给了但无法识别时，保存原始字符串供告警回显；否则为 NULL
+        LPCSTR                      vpn_policy_bad_string;
         // Outbound proxy for the underlying QUIC transport (RFC 9298
         // CONNECT-UDP / MASQUE). Parsed from the "proxy_url" config key, e.g.
         // "masque://proxy.example.com:443". TT_PROXY_NONE means direct.

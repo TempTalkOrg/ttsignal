@@ -23,6 +23,23 @@ class IServerConnectionHandler;
 class SMPServerConnection;
 typedef std::shared_ptr<SMPServerConnection>    ServerConnPtr;
 
+// WebSocket 那一侧的连接。jmp 把这个 typedef 放在 Interface.h 里（Interface.h:32），
+// 本项目照做 —— 绑定层拿到的是 WSConnPtr，不该为此 include 整个 WSConnector.h。
+namespace WS
+{
+	class WSConnection;
+}
+typedef std::shared_ptr<WS::WSConnection>		WSConnPtr;
+
+// 与 LLHTTPParser.h:32 的定义逐字一致 —— 同一类型的重复 typedef 在 C++ 里合法
+// （TcpChannel.h 顶部的 BufferPtr 是同样的处理）。
+//
+// ⚠️ 刻意**不** include LLHTTPParser.h：那会把 llhttp.h 拖进每一个 include
+// Interface.h 的 TU，而 src/cpp/http-parser/http_parser.h（napi 的
+// JsSMPConnectorWrap.cpp 还在用）与 llhttp.h 的 HTTP_* 枚举名逐个撞车，
+// 编译期直接报 "redefinition of enumerator 'HTTP_DELETE'" 一整屏。
+typedef std::map<std::string, std::string>		HttpHeaderMap;
+
 typedef	std::map<std::string, size_t>			ConnStatsMap;
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -188,6 +205,62 @@ public:
 	virtual void		OnException(BCException &)			= 0;
 private:
 	DECLARE_NO_COPY_CLASS(IConnectionHandler);
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// class : IWSConnectorHandler
+//
+// WebSocket 连接器级回调。与 IWSConnectionHandler 一起沿用 jmp 的接口位置
+// （都放在 Interface.h 里），下一轮 JNI / NAPI / Swift 绑定按这里对齐。
+//
+// ⚠️ OnLog 的限制远比其它回调严格：它是被 BC 日志器持着一把**全局非递归自旋锁**
+//    调进来的，因此在 OnLog 里**不得**调用 WSConnector / WSConnection 任何会打
+//    日志的接口（Create / CreateConnection / Connect / 析构），否则重进那把锁
+//    就是 100% CPU 空转挂死。细节见 WSConnector.h 顶部契约。
+///////////////////////////////////////////////////////////////////////////////
+
+class IWSConnectorHandler
+{
+public:
+	IWSConnectorHandler() {}
+	virtual ~IWSConnectorHandler() {}
+
+	virtual void		OnLog(int level, LPCSTR lpszMsg)	= 0;
+	virtual void		OnClosed()							= 0;
+	virtual void		OnException(BCException &)			= 0;
+private:
+	DECLARE_NO_COPY_CLASS(IWSConnectorHandler);
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Class : IWSConnectionHandler
+//
+// 一条 WebSocket 连接的回调。时序契约（详见 WSConnector.h）：
+//   * Connect() 返回 BC_R_SUCCESS 之后，OnConnectResult 恰好回调一次；
+//   * result == BC_R_SUCCESS 时，之后还会恰好回调一次 OnClosed；
+//   * result != BC_R_SUCCESS 时，**不会**再有 OnClosed —— 握手就没成功，
+//     没有"连接关闭"这件事可报。
+//
+// ⚠️ OnRecvText 拿到的是 NUL 结尾的 C 字符串（签名与 jmp 一致，便于绑定层直接
+//    NewStringUTF / napi_create_string_utf8）。因此**文本帧里内嵌的 NUL 会造成
+//    截断**；需要精确长度的二进制内容请走 binary 帧（OnRecvData 带 size）。
+///////////////////////////////////////////////////////////////////////////////
+
+class IWSConnectionHandler
+{
+public:
+	IWSConnectionHandler(){}
+	virtual ~IWSConnectionHandler(){}
+
+	virtual void		OnConnectResult(
+							BCRESULT result,
+							const HttpHeaderMap &headers)	= 0;
+	virtual void		OnRecvText(LPCSTR lpszText)			= 0;
+	virtual void		OnRecvData(LPCVOID data, size_t size)= 0;
+	virtual void		OnClosed(LPCSTR lpszReason)			= 0;
+	virtual void		OnException(BCException &)			= 0;
+private:
+	DECLARE_NO_COPY_CLASS(IWSConnectionHandler);
 };
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -9,5 +9,9 @@ module TTSignalC {
     header "INetworkPathMonitor.h"
     header "AppleNetworkMonitor.h"
     header "ios_logger.h"
+    // TTVpnPolicy 与 tt_vpn_policy_* 辅助函数。INetworkPathMonitor.h 会
+    // #include 它，必须显式声明为 module 成员，否则 clang 会报
+    // non-modular header included in framework module。
+    header "VpnPolicy.h"
     export *
 }

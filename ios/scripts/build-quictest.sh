@@ -107,7 +107,8 @@ libtool -static -o "${MERGED_A}" \
     "${DEPS_ROOT}/lib/libjquic.a" \
     "${DEPS_ROOT}/lib/libssl.a" \
     "${DEPS_ROOT}/lib/libcrypto.a" \
-    "${DEPS_ROOT}/lib/libenv.a"
+    "${DEPS_ROOT}/lib/libenv.a" \
+    "${DEPS_ROOT}/lib/libllhttp.a"
 
 # ----------------------------------------------------------------------------
 # Stage public headers + module.modulemap so QUICTest's HEADER_SEARCH_PATHS

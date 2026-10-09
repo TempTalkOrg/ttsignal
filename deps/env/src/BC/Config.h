@@ -385,9 +385,10 @@ typedef unsigned int		BCRESULT;
 #define BC_R_DBERROR			61  /*%< database error */
 #define BC_R_INVALIDPTR			62  /*%< invalid pointer */
 #define BC_R_INVALIDARG			63  /*%< invalid arguments */
+#define BC_R_NO_PHYSICAL_INTERFACE	64  /*%< no physical network interface */
 
 /*% Not a result code: the number of results. */
-#define BC_R_NRESULTS 			64
+#define BC_R_NRESULTS 			65
 
 
 /* stderror */

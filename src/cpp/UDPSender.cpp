@@ -8,6 +8,7 @@
 #include <BC/BCLog.h>
 #include <BC/Utils.h>
 #include "Utils.h"
+#include "SocketPinner.h"
 #ifdef OS_ANDROID
 #include <android/api-level.h>
 #include <dlfcn.h>
@@ -44,6 +45,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>  // inet_ntop for route-lookup diagnostic logging
+#include <net/if.h>     // if_indextoname / IF_NAMESIZE for SO_BINDTODEVICE
 #include <cerrno>
 // IPV6_UNICAST_IF was added to the Linux kernel uapi headers in 5.7. Older
 // cross-toolchain sysroots (e.g. the homebrew aarch64-unknown-linux-gnu
@@ -82,33 +84,11 @@
 #define SNDR_STATE_READING		4
 #define SNDR_STATE_MAX			9
 
-#if defined(__APPLE__)
-// Is `addr` a TUN-mode-VPN fake-IP — i.e. a numerically valid IPv4 whose
-// route only exists *inside* a transparent proxy and whose packets would
-// land in a black hole if we forced them out via a physical interface?
-//
-// We check the two well-known default ranges that catch the entire
-// out-of-the-box install base of fake-IP proxies on macOS / iOS:
-//
-//   * 198.18.0.0/15  RFC 2544 BENCHMARK. Default for Clash (Verge, Stash,
-//                    Mihomo), Surge ≥4, V2Ray Xray, sing-box, Loon,
-//                    Shadowrocket, etc.
-//   * 28.0.0.0/8     Surge legacy default before they migrated to 198.18,
-//                    still common on older configs.
-//
-// IPv6 fake-IPs are not a thing in the wild (proxies stick to v4
-// fake-IPs even when the real backend is dual-stack), so we deliberately
-// ignore AF_INET6 here. Users whose proxy uses a non-default fake-IP
-// range can still escape via `bypassVpn=false` on the connector.
-static bool _IsFakeIPPeer(const BCSockAddrS& addr)
-{
-	if (addr.type.sa.sa_family != AF_INET) return false;
-	uint32_t ip = ntohl(addr.type.sin.sin_addr.s_addr);
-	if ((ip & 0xFFFE0000u) == 0xC6120000u) return true; // 198.18.0.0/15
-	if ((ip & 0xFF000000u) == 0x1C000000u) return true; // 28.0.0.0/8
-	return false;
-}
-#endif
+// 对端地址分类（TUN 代理 fake-IP 段 / 私网等非全局可路由段）与"绑定该不该
+// 留"的决策，已抽到 VpnPolicy.cpp 的 tt_peer_address_class() /
+// tt_vpn_pin_recheck()，抽出来的目的是让这套判定可以被单测穷举
+// （src/cpp/tests/VpnPolicy_test.cpp）。判定的完整依据见 VpnPolicy.h 里
+// tt_vpn_pin_recheck() 的注释和下面 Connect() 里的注释。
 
 
 
@@ -161,6 +141,7 @@ UDPSender::UDPSender()
 	, m_nRecvDataCount(0)
 	, m_nNetworkHandle(0)
 	, m_bInterfaceBindingActive(false)
+	, m_eVpnPolicy(TT_VPN_POLICY_UNSET)
 {
 	memset(&m_sSelfAddr, 0, sizeof(BCSockAddrS));
 	memset(&m_sSockAddr, 0, sizeof(BCSockAddrS));
@@ -178,7 +159,8 @@ BCRESULT UDPSender::Create(
 	BCFObject *pConfig,
 	IUDPSenderHandler *pHandler,
 	bool bindIP,
-	bool bindPort)
+	bool bindPort,
+	int64_t initialNetworkHandle)
 {
 	BCRESULT result;
 
@@ -218,6 +200,8 @@ BCRESULT UDPSender::Create(
 	m_pHandler			= pHandler;
 	m_bBindIP 			= bindIP;
 	m_bBindPort 		= bindPort;
+	// 必须在 _InitSocket() 之前设好——绑定就发生在那里面。
+	m_nNetworkHandle	= initialNetworkHandle;
 
 	result = _InitSocket();
 	if (result != BC_R_SUCCESS)
@@ -317,20 +301,70 @@ BCRESULT UDPSender::Connect(BCSockAddrS& refSockAddr)
 			(refSockAddr.type.sa.sa_family == AF_INET6)
 				? static_cast<socklen_t>(sizeof(refSockAddr.type.sin6))
 				: static_cast<socklen_t>(sizeof(refSockAddr.type.sin));
-		uint32_t natural_idx =
-			tt_route_lookup_ifindex(&refSockAddr.type.sa, peer_len);
+		const uint32_t bound_idx = static_cast<uint32_t>(m_nNetworkHandle);
 
-		const bool mismatch =
-			(natural_idx != 0 &&
-			 natural_idx != static_cast<uint32_t>(m_nNetworkHandle));
+		// ⚠️ 这里做**两次**路由查询，它们问的不是同一个问题，不要合并：
+		//
+		//   * scoped（scope=bound_idx）——"这条已经硬绑在 bound_idx 上的 socket，
+		//     包会从哪出去"。这是**绑定有效性**的唯一正确判据，和
+		//     TcpChannel::_RouteRecheck 完全一致。macOS 的 IP_BOUND_IF 是硬绑定，
+		//     内核会在该网卡的 scoped 路由表里重做 FIB 查询，谁占着全局默认路由与
+		//     它无关。拿全局答案来校验硬绑定 = VPN 抢默认路由时 100% 假阴性。
+		//   * global（scope=0）——"内核本来想把这个对端交给谁"。它**只**喂给黑洞
+		//     启发式，不参与绑定有效性判定。
+		//
+		// 历史背景：这里以前只做全局查询并用它判 mismatch，于是企业 VPN 抢走默认
+		// 路由时 prefer-physical 必然误判不一致、解绑回落 VPN，服务端看到的是 VPN
+		// 出口 IP；而同一台机器上 TCP/HTTP/WS 那条路径（TcpChannel 用 scoped）保持
+		// 绑定、拿到真实 IP。同一份默认配置下两条路径行为相反，正是"有时拿到有时
+		// 拿不到"的成因。
+		//
+		// 但**只**改成 scoped 是错的：macOS 的 scoped 查询会忽略挂在别的网卡上的
+		// 非 scoped 专用路由，实测（en0=14 / utun4=22，GlobalProtect 全隧道）
+		//     route -n get            198.18.0.5 -> utun4
+		//     route -n get -ifscope en0 198.18.0.5 -> en0
+		//     route -n get            10.10.0.1  -> utun4
+		//     route -n get -ifscope en0 10.10.0.1  -> en0
+		// 也就是说只要被绑网卡有默认路由，scoped 查询几乎永远答"被绑网卡自己"。
+		// 若黑洞判定也跟着看 scoped，fake-IP（Clash/Surge TUN）与"只能经 VPN 到达
+		// 的内网地址"就再也检不出来——包静默丢弃，而 IP_BOUND_IF 下 connect()/
+		// send() 都返回成功，QUIC 这条路径没有任何反应式补救（见函数顶部的平台
+		// 注释）。所以黑洞判定改走另一条判据：**地址段 + 全局路由表**，实现在
+		// tt_vpn_pin_recheck() 里。
+		const uint32_t scoped_idx = tt_route_lookup_ifindex(
+			&refSockAddr.type.sa, peer_len, /*scope_ifindex=*/bound_idx);
+		const uint32_t global_idx = tt_route_lookup_ifindex(
+			&refSockAddr.type.sa, peer_len, /*scope_ifindex=*/0);
+
 #if defined(__APPLE__)
-		const bool fake_ip_fallback =
-			(natural_idx == 0 && _IsFakeIPPeer(refSockAddr));
+		// 地址段启发式只在 Apple 上启用，与改动前 fake_ip_fallback 的
+		// #if defined(__APPLE__) 门禁位置完全相同。传 TT_PEER_CLASS_GLOBAL 等于
+		// 关掉这条判据，于是 Linux / Windows 的行为逐位不变。
+		const uint32_t peer_class =
+			tt_peer_address_class(&refSockAddr.type.sa, (size_t)peer_len);
 #else
-		const bool fake_ip_fallback = false;
+		const uint32_t peer_class = TT_PEER_CLASS_GLOBAL;
 #endif
 
-		if (mismatch || fake_ip_fallback)
+		// Linux / Windows 的 tt_route_lookup_ifindex 实现**刻意忽略** scope 参数
+		// （见 NetworkRouteLookup.h），所以那两个平台上 scoped_idx == global_idx，
+		// 上面多做的一次查询是等价查询，判定结果与改动前一致。
+		TTPinRecheckReason recheck_reason = TT_PIN_REASON_OK;
+		const TTPinVerdict verdict = tt_vpn_pin_recheck(
+			m_eVpnPolicy, bound_idx, scoped_idx, global_idx,
+			peer_class, &recheck_reason);
+
+		// force-physical 永不解绑，但它的诊断日志要保留：触发条件与改动前完全
+		// 一致（全局表与绑定不一致，或全局表查不出来且对端落在 fake-IP 段），
+		// 只是把 scoped 的答案一并打出来，方便现场区分"误报"与"真不可达"。
+		const bool force_diag =
+			(m_eVpnPolicy == TT_VPN_POLICY_FORCE_PHYSICAL) &&
+			(((global_idx != TT_ROUTE_IFINDEX_UNKNOWN &&
+			   global_idx != bound_idx)) ||
+			 (global_idx == TT_ROUTE_IFINDEX_UNKNOWN &&
+			  (peer_class & TT_PEER_CLASS_FAKE_IP) != 0));
+
+		if (verdict == TT_PIN_VERDICT_UNPIN || force_diag)
 		{
 			char ipbuf[INET6_ADDRSTRLEN] = {0};
 			const void* ip_src = (refSockAddr.type.sa.sa_family == AF_INET6)
@@ -339,26 +373,61 @@ BCRESULT UDPSender::Connect(BCSockAddrS& refSockAddr)
 			inet_ntop(refSockAddr.type.sa.sa_family, ip_src,
 				ipbuf, sizeof(ipbuf));
 
-#if defined(__APPLE__)
-			if (mismatch)
+			if (m_eVpnPolicy == TT_VPN_POLICY_FORCE_PHYSICAL)
 			{
+				// force-physical 是业务显式声明"必须拿到真实 IP"，此时保持
+				// 绑定、让连接失败才是正确行为——静默回落会让"有时拿到真实
+				// IP、有时拿不到"变成不可复现的线上问题。这里恒为
+				// TT_PIN_VERDICT_KEEP，只打诊断。
 				LogQ(m_pLoggerCtx, _WARN_,
-					"UDP Sender: kernel routes peer %s via ifIndex=%u "
-					"but we pinned IP_BOUND_IF=%lld; unpinning to "
-					"avoid blackhole (TUN-mode proxy / VPN / Private "
-					"Relay). Set bypassVpn=false on the connector to "
-					"silence this for your topology.",
-					ipbuf, natural_idx, (long long)m_nNetworkHandle);
+					"UDP Sender: 全局路由表认为对端 %s 应走 ifIndex=%u，与已绑定的 "
+					"ifIndex=%lld 不一致；vpnPolicy=force-physical，保持绑定不解除。"
+					"这条日志本身不代表出错：VPN 抢占默认路由时全局表必然报不一致，"
+					"而 macOS 的 IP_BOUND_IF 是硬绑定，包仍从物理网卡出去、服务端看到"
+					"的仍是真实 IP。判断实际是否可达请看 scoped 路由表的答案："
+					"scoped(ifIndex=%lld) -> %u（%u 表示查不出来，%u 表示该网卡的 "
+					"scoped 表里确实没有到对端的路由，那才是真不可达）。",
+					ipbuf, global_idx, (long long)m_nNetworkHandle,
+					(long long)m_nNetworkHandle, scoped_idx,
+					(unsigned)TT_ROUTE_IFINDEX_UNKNOWN,
+					(unsigned)TT_ROUTE_IFINDEX_NO_ROUTE);
 			}
 			else
 			{
+#if defined(__APPLE__)
+			if (recheck_reason == TT_PIN_REASON_BLACKHOLE_RISK)
+			{
 				LogQ(m_pLoggerCtx, _WARN_,
-					"UDP Sender: route lookup failed for peer %s; "
-					"peer falls in TUN-mode fake-IP range "
-					"(198.18.0.0/15 or 28.0.0.0/8); proactively "
-					"clearing IP_BOUND_IF=%lld via heuristic "
-					"fallback.",
-					ipbuf, (long long)m_nNetworkHandle);
+					"UDP Sender: 对端 %s 不是全局可路由地址（peerClass=0x%x："
+					"0x1=TUN 代理 fake-IP 段 198.18.0.0/15 / 28.0.0.0/8，"
+					"0x2=私网 / CGNAT / 链路本地 / 环回 / 保留段），而全局路由表把它"
+					"判给 ifIndex=%u（%u 表示查不出来），与已绑定的 IP_BOUND_IF=%lld "
+					"不一致。这类地址在公网上不可达，硬绑在物理网卡上发出去是静默"
+					"黑洞，主动解绑回落系统路由。policy=%s。",
+					ipbuf, (unsigned)peer_class, global_idx,
+					(unsigned)TT_ROUTE_IFINDEX_UNKNOWN,
+					(long long)m_nNetworkHandle,
+					tt_vpn_policy_to_string(m_eVpnPolicy));
+			}
+			else if (recheck_reason == TT_PIN_REASON_SCOPED_NO_ROUTE)
+			{
+				LogQ(m_pLoggerCtx, _WARN_,
+					"UDP Sender: 已绑定 IP_BOUND_IF=%lld，但内核在这块网卡的 scoped "
+					"路由表里找不到到 %s 的路由（该网卡没有可用默认路由 / 地址族不"
+					"匹配）。这是确定性不可达，解绑回落系统路由。policy=%s。",
+					(long long)m_nNetworkHandle, ipbuf,
+					tt_vpn_policy_to_string(m_eVpnPolicy));
+			}
+			else
+			{
+				// SCOPED_MISMATCH（prefer-physical）或 GLOBAL_MISMATCH（os）。
+				LogQ(m_pLoggerCtx, _WARN_,
+					"UDP Sender: 路由复核判定绑定无效（reason=%s，scoped=%u，"
+					"global=%u），与已绑定的 IP_BOUND_IF=%lld 不一致，解绑以避免"
+					"黑洞（TUN 模式代理 / VPN / Private Relay）。对端 %s，policy=%s。",
+					tt_vpn_pin_reason_to_string(recheck_reason),
+					scoped_idx, global_idx, (long long)m_nNetworkHandle,
+					ipbuf, tt_vpn_policy_to_string(m_eVpnPolicy));
 			}
 			// BC_R_SUCCESS as trigger reason — no kernel error here,
 			// the setsockopt(IP_BOUND_IF=0) machinery is just being
@@ -370,26 +439,36 @@ BCRESULT UDPSender::Connect(BCSockAddrS& refSockAddr)
 			// even though IP_UNICAST_IF advertises itself as a hint.
 			// Drop the hint so the next sendto() picks the source IP
 			// from the actual egress interface.
+			//
+			// WinRouteLookup 忽略 scope 参数，所以这里 scoped==global，
+			// 判定与改动前一致。
 			LogQ(m_pLoggerCtx, _WARN_,
 				"UDP Sender: kernel routes peer %s via ifIndex=%u "
 				"but we hinted IP_UNICAST_IF=%lld; clearing hint to "
 				"avoid source/route split (TUN-mode proxy / VPN). "
 				"Set bypassVpn=false on the connector to silence "
-				"this for your topology.",
-				ipbuf, natural_idx, (long long)m_nNetworkHandle);
+				"this for your topology. (reason=%s)",
+				ipbuf, global_idx, (long long)m_nNetworkHandle,
+				tt_vpn_pin_reason_to_string(recheck_reason));
 			_TryClearInterfaceBinding(BC_R_SUCCESS);
 #else
 			// Linux: IP_UNICAST_IF is a true soft hint, the kernel
 			// will auto-fall-back to the real route AND adjust the
 			// source IP, so we don't touch the socket. Surface the
 			// discrepancy in logs only.
+			//
+			// LinuxRouteLookup 忽略 scope 参数，所以这里 scoped==global，
+			// 判定与改动前一致。
 			LogQ(m_pLoggerCtx, _WARN_,
 				"UDP Sender: kernel routes peer %s via ifIndex=%u "
 				"but we hinted IP_UNICAST_IF=%lld; source IP may be "
 				"wrong on the wire. Diagnostic only — kernel will "
-				"route correctly via the real outbound interface.",
-				ipbuf, natural_idx, (long long)m_nNetworkHandle);
+				"route correctly via the real outbound interface. "
+				"(reason=%s)",
+				ipbuf, global_idx, (long long)m_nNetworkHandle,
+				tt_vpn_pin_reason_to_string(recheck_reason));
 #endif
+			}
 		}
 	}
 	return m_pSocket->Connect(&refSockAddr, GetTask(), _ConnectDoneCB, this);
@@ -502,105 +581,27 @@ BCRESULT UDPSender::_InitSocket()
 		goto delete_socket;
 	}
 	m_pSocket->GetSockName(&m_sSelfAddr);
-#ifdef OS_ANDROID
-	if (m_nNetworkHandle != 0 && android_get_device_api_level() >= 23)
+	// 平台相关的网卡绑定已抽到 SocketPinner，UDP 与 TCP 共用同一份实现。
 	{
-		typedef int (*pfn_android_setsocknetwork)(uint64_t, int);
-		static pfn_android_setsocknetwork fn = (pfn_android_setsocknetwork)
-			dlsym(RTLD_DEFAULT, "android_setsocknetwork");
-		if (fn)
+		TTPinRequest pin;
+		memset(&pin, 0, sizeof(pin));
+		pin.fd               = m_pSocket->GetFd();
+		pin.ifIndex          = (uint32_t)m_nNetworkHandle;
+		pin.androidNetHandle = (uint64_t)m_nNetworkHandle;
+		pin.ipv6             = m_sConfig.ipv6 ? 1 : 0;
+		pin.isTcp            = 0;
+		pin.policy           = m_eVpnPolicy;
+		pin.loggerCtx        = m_pLoggerCtx;
+
+		char method[32] = "";
+		int  pinErrno   = 0;
+		TTPinResult pinResult =
+			tt_socket_pin(&pin, method, sizeof(method), &pinErrno);
+		if (pinResult == TT_PIN_OK)
 		{
-			int ret = fn((uint64_t)m_nNetworkHandle, m_pSocket->GetFd());
-			LogQ(m_pLoggerCtx, _DEBUG_,
-				"UDP Sender: android_setsocknetwork(handle=%lld, fd=%d) = %d, errno=%d",
-				(long long)m_nNetworkHandle, m_pSocket->GetFd(), ret, ret == 0 ? 0 : errno);
-			if (ret == 0) m_bInterfaceBindingActive = true;
-		}
-		else
-		{
-			LogQ(m_pLoggerCtx, _WARN_,
-				"UDP Sender: android_setsocknetwork not found via dlsym");
-		}
-	}
-#elif defined(__APPLE__)
-	// macOS + iOS: bind the UDP socket to a specific interface so the kernel
-	// stops following the system "best path" automatically. The caller
-	// (AppleNetworkMonitor) passes an ifIndex from if_nametoindex() through
-	// the SMPConnection::Restart -> UDPSender::Restart chain as
-	// m_nNetworkHandle. IP_BOUND_IF is the Apple equivalent of Android's
-	// android_setsocknetwork. Fake-IP / TUN-mode-VPN handling lives in
-	// UDPSender::Connect (it's the only entry point that learns the peer
-	// address), so we just install the pin unconditionally here.
-	if (m_nNetworkHandle != 0)
-	{
-		uint32_t ifIndex = (uint32_t)m_nNetworkHandle;
-		int fd = m_pSocket->GetFd();
-		int retV4 = setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &ifIndex, sizeof(ifIndex));
-		int errV4 = (retV4 == 0) ? 0 : errno;
-		int retV6 = 0;
-		int errV6 = 0;
-		if (m_sConfig.ipv6)
-		{
-			retV6 = setsockopt(fd, IPPROTO_IPV6, IPV6_BOUND_IF, &ifIndex, sizeof(ifIndex));
-			errV6 = (retV6 == 0) ? 0 : errno;
-		}
-		LogQ(m_pLoggerCtx, _DEBUG_,
-			"UDP Sender: setsockopt(IP_BOUND_IF, ifIndex=%u, fd=%d) v4=%d/errno=%d v6=%d/errno=%d",
-			ifIndex, fd, retV4, errV4, retV6, errV6);
-		if (retV4 == 0 || (m_sConfig.ipv6 && retV6 == 0))
 			m_bInterfaceBindingActive = true;
-	}
-#elif defined(__linux__) && !defined(OS_ANDROID)
-	// Linux (non-Android): bind via IP_UNICAST_IF. Caller (LinuxNetlinkMonitor)
-	// passes ifIndex obtained from RTM_GETROUTE/RTA_OIF in m_nNetworkHandle.
-	// Index is in HOST byte order on Linux — DO NOT htonl here (Windows is
-	// the only platform that requires byte-swapping).
-	if (m_nNetworkHandle != 0)
-	{
-		uint32_t ifIndex = (uint32_t)m_nNetworkHandle;
-		int fd = m_pSocket->GetFd();
-		int retV4 = setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, &ifIndex, sizeof(ifIndex));
-		int errV4 = (retV4 == 0) ? 0 : errno;
-		int retV6 = 0;
-		int errV6 = 0;
-		if (m_sConfig.ipv6)
-		{
-			retV6 = setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, &ifIndex, sizeof(ifIndex));
-			errV6 = (retV6 == 0) ? 0 : errno;
 		}
-		LogQ(m_pLoggerCtx, _DEBUG_,
-			"UDP Sender: setsockopt(IP_UNICAST_IF, ifIndex=%u, fd=%d) v4=%d/errno=%d v6=%d/errno=%d",
-			ifIndex, fd, retV4, errV4, retV6, errV6);
-		if (retV4 == 0 || (m_sConfig.ipv6 && retV6 == 0))
-			m_bInterfaceBindingActive = true;
 	}
-#elif defined(_WIN32)
-	// Windows: IP_UNICAST_IF requires the IPv4 ifIndex in NETWORK byte order
-	// (htonl). IPv6 stays in host order. Caller (WinIpChangeMonitor) supplies
-	// ifIndex from GetBestInterfaceEx in m_nNetworkHandle.
-	if (m_nNetworkHandle != 0)
-	{
-		DWORD ifIndex = (DWORD)m_nNetworkHandle;
-		DWORD ifIndexBE = htonl(ifIndex);
-		int fd = m_pSocket->GetFd();
-		int retV4 = setsockopt((SOCKET)fd, IPPROTO_IP, IP_UNICAST_IF,
-			(const char*)&ifIndexBE, sizeof(ifIndexBE));
-		int errV4 = (retV4 == 0) ? 0 : WSAGetLastError();
-		int retV6 = 0;
-		int errV6 = 0;
-		if (m_sConfig.ipv6)
-		{
-			retV6 = setsockopt((SOCKET)fd, IPPROTO_IPV6, IPV6_UNICAST_IF,
-				(const char*)&ifIndex, sizeof(ifIndex));
-			errV6 = (retV6 == 0) ? 0 : WSAGetLastError();
-		}
-		LogQ(m_pLoggerCtx, _DEBUG_,
-			"UDP Sender: setsockopt(IP_UNICAST_IF, ifIndex=%u, fd=%d) v4=%d/wsa=%d v6=%d/wsa=%d",
-			(unsigned)ifIndex, fd, retV4, errV4, retV6, errV6);
-		if (retV4 == 0 || (m_sConfig.ipv6 && retV6 == 0))
-			m_bInterfaceBindingActive = true;
-	}
-#endif
 	char local_addr_str_[128];
 	bc_sockaddr_format(&m_sSelfAddr, local_addr_str_, sizeof(local_addr_str_));
 	LogQ(m_pLoggerCtx, _INFO_, "UDP Sender: started at %s (networkHandle=%lld)",
@@ -1236,48 +1237,13 @@ bool UDPSender::_TryClearInterfaceBinding(BCRESULT triggerResult)
 		return false;
 	}
 
-	int retV4 = 0;
-	int errV4 = 0;
-	int retV6 = 0;
-	int errV6 = 0;
-
-#if defined(__APPLE__)
-	uint32_t zero = 0;
-	retV4 = setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &zero, sizeof(zero));
-	errV4 = (retV4 == 0) ? 0 : errno;
-	if (m_sConfig.ipv6)
-	{
-		retV6 = setsockopt(fd, IPPROTO_IPV6, IPV6_BOUND_IF, &zero, sizeof(zero));
-		errV6 = (retV6 == 0) ? 0 : errno;
-	}
-	const char* opt_name = "IP_BOUND_IF";
-#elif defined(_WIN32)
-	// IP_UNICAST_IF: IPv4 takes a network-byte-order DWORD, IPv6 takes a
-	// host-order DWORD. Zero is byte-order-agnostic so we pass it as-is.
-	DWORD zero = 0;
-	retV4 = setsockopt((SOCKET)fd, IPPROTO_IP, IP_UNICAST_IF,
-		(const char*)&zero, sizeof(zero));
-	errV4 = (retV4 == 0) ? 0 : WSAGetLastError();
-	if (m_sConfig.ipv6)
-	{
-		retV6 = setsockopt((SOCKET)fd, IPPROTO_IPV6, IPV6_UNICAST_IF,
-			(const char*)&zero, sizeof(zero));
-		errV6 = (retV6 == 0) ? 0 : WSAGetLastError();
-	}
-	const char* opt_name = "IP_UNICAST_IF";
-#else  // Linux non-Android
-	// Linux: IP_UNICAST_IF takes a host-order uint32 (no htonl), and 0
-	// means "no hint". Same option for v4 and v6 (IPV6_UNICAST_IF == 76).
-	uint32_t zero = 0;
-	retV4 = setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, &zero, sizeof(zero));
-	errV4 = (retV4 == 0) ? 0 : errno;
-	if (m_sConfig.ipv6)
-	{
-		retV6 = setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, &zero, sizeof(zero));
-		errV6 = (retV6 == 0) ? 0 : errno;
-	}
-	const char* opt_name = "IP_UNICAST_IF";
-#endif
+	// 平台相关的解绑实现已抽到 SocketPinner，UDP 与 TCP 共用同一份实现。
+	// v4/v6 分列的 setsockopt 结果在 SocketPinner 内部以 _DEBUG_ 记录；
+	// 这里只取回合并后的手段名 + errno，供下面的 _WARN_ 现场排查用。
+	char method[32] = "";
+	int  unpinErrno = 0;
+	tt_socket_unpin(fd, m_sConfig.ipv6 ? 1 : 0, m_pLoggerCtx,
+		method, sizeof(method), &unpinErrno);
 
 	// Mark as cleared even if one of the setsockopt calls failed: we still
 	// don't want to spam this fallback path again on the next NETUNREACH
@@ -1286,13 +1252,12 @@ bool UDPSender::_TryClearInterfaceBinding(BCRESULT triggerResult)
 	m_bInterfaceBindingActive = false;
 
 	LogQ(m_pLoggerCtx, _WARN_,
-		"UDP Sender: clearing %s after trigger=%u (%s) fd=%d v4=%d/err=%d v6=%d/err=%d. "
+		"UDP Sender: clearing %s after trigger=%u (%s) fd=%d errno=%d. "
 		"Likely a TUN-mode VPN (Clash / Surge / V2Ray) where the server hostname "
 		"resolved to a fake-IP / a route only present on the proxy adapter; "
 		"falling back to OS default routing.",
-		opt_name,
-		(unsigned)triggerResult, BC::bc_result2string(triggerResult),
-		fd, retV4, errV4, retV6, errV6);
+		method, (unsigned)triggerResult, BC::bc_result2string(triggerResult),
+		fd, unpinErrno);
 	return true;
 #else
 	(void)triggerResult;
@@ -1325,7 +1290,20 @@ void UDPSender::_OnConnectDone(BCRESULT result)
 	if (result == BC_R_NETUNREACH || result == BC_R_HOSTUNREACH ||
 		result == BC_R_ADDRNOTAVAIL)
 	{
-		_TryClearInterfaceBinding(result);
+		if (m_eVpnPolicy == TT_VPN_POLICY_FORCE_PHYSICAL)
+		{
+			// 同 Connect() 里的主动校验：force-physical 下"连不上"就是正确
+			// 结果，不能靠解绑偷偷把流量放回 VPN。错误如实上抛给业务。
+			LogQ(m_pLoggerCtx, _WARN_,
+				"UDP Sender: connect 失败 result=%u (%s) 且已绑定 ifIndex=%lld，"
+				"但 vpnPolicy=force-physical，不解除绑定，错误如实上抛。",
+				(unsigned)result, BC::bc_result2string(result),
+				(long long)m_nNetworkHandle);
+		}
+		else
+		{
+			_TryClearInterfaceBinding(result);
+		}
 	}
 }
 

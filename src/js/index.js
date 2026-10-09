@@ -1009,6 +1009,44 @@ ttsignal.ServerConnection.prototype.close = function(){
  *   so application code does NOT need to call `connection.restart()`
  *   manually. Set `disableAutoRestart: true` for long-lived server
  *   deployments where the box never roams.
+ * @param config.vpnPolicy {String=} optional, one of `'os'`,
+ *   `'prefer-physical'`, `'force-physical'`. Controls whether QUIC traffic is
+ *   allowed to ride a VPN / virtual interface (utun on macOS/iOS, tun on
+ *   Linux, wintun/TAP on Windows).
+ *
+ *   - `'os'` — follow the kernel's routing decision, including VPN tunnels.
+ *     No interface pin is installed at all.
+ *   - `'prefer-physical'` — prefer wifi/wired/cellular. At startup, fall back
+ *     to a tunnel if no physical interface exists; while running, refuse to
+ *     migrate onto a tunnel (keep the current socket instead).
+ *   - `'force-physical'` — physical interfaces only. Never fall back, and
+ *     never undo the interface pin even when the kernel routing table says
+ *     the peer is reachable only through the tunnel. Use this when the server
+ *     must observe the client's real IP rather than the VPN egress IP.
+ *
+ *   Defaults: `'prefer-physical'` on macOS / Windows / Linux, `'os'` on iOS.
+ *
+ *   ⚠️ Windows behaviour change: before this option existed, Windows
+ *   effectively behaved as `'os'` (GetBestInterfaceEx does no interface-type
+ *   filtering). It now defaults to `'prefer-physical'` like the other desktop
+ *   platforms. Pass `vpnPolicy: 'os'` explicitly to keep the old behaviour.
+ *
+ *   With `'force-physical'`, `connection.connect()` fails immediately with
+ *   `BC_R_NO_PHYSICAL_INTERFACE` (64) when no physical interface is
+ *   available — it does NOT wait for the connect timeout. Handle that error
+ *   by either reconnecting with `'prefer-physical'` or telling the user to
+ *   turn off their VPN.
+ *
+ *   Linux caveat: only `SO_BINDTODEVICE` can truly guarantee packets leave
+ *   via the physical NIC, and it requires `CAP_NET_RAW` (or root). Without
+ *   that capability the addon falls back to `IP_UNICAST_IF`, which is
+ *   silently ignored on kernels older than 6.0.16 / 6.1.2 / 6.2 for connected
+ *   UDP sockets. On such hosts under a full-tunnel proxy, `'force-physical'`
+ *   guarantees only that failures are visible, not that the real IP gets
+ *   through. A warning is logged when this fallback happens.
+ * @param config.bypassVpn {Boolean=} **deprecated**, use `vpnPolicy` instead.
+ *   Mapped as `false` -> `'os'`, `true` -> `'prefer-physical'`. When both are
+ *   given, `vpnPolicy` wins and a warning is logged.
  * @param config.proxyUrl {String=} optional MASQUE CONNECT-UDP (RFC 9298)
  *   proxy. When set, every connection created from this connector tunnels its
  *   QUIC packets to the real server through an HTTP/3 CONNECT-UDP session to
@@ -1041,6 +1079,15 @@ ttsignal.createConnector = function(config){
     }
     if (!config.alpn){
         throw Error('Invalid alpn value.');
+    }
+    // 在 JS 层就对非法取值抛错，比让原生层告警后静默回落平台默认值更容易
+    // 发现拼写错误——后者只会在日志里留一行 WARN，业务多半看不到。
+    if (config.vpnPolicy !== undefined) {
+        var VALID_VPN_POLICIES = ['os', 'prefer-physical', 'force-physical'];
+        if (VALID_VPN_POLICIES.indexOf(config.vpnPolicy) === -1) {
+            throw Error('Invalid vpnPolicy: ' + config.vpnPolicy +
+                '. Expected one of ' + VALID_VPN_POLICIES.join(', ') + '.');
+        }
     }
     if (config.caCertPem && !config.ca_cert_pem) {
         config.ca_cert_pem = config.caCertPem;
@@ -1082,10 +1129,683 @@ ttsignal.createServer = function(config){
 }
 
 //*******************************************************************************
-// Exports : 
+// HTTP / WebSocket 栈（真实 IP 出网）的胶水层
+//
+// 原生层导出的是带双下划线的原始接口（__createHttpConnector__ / __request__ /
+// __createWsConnector__ / __connect__ ...），本节把它们包成惯用的 JS 形态。
+//
+//   HTTP —— 一次性请求，用 Promise
+//     const http = ttsignal.createHttpConnector({ vpnPolicy: 'force-physical' });
+//     const resp = await http.request({ method: 'GET', url: 'https://host/path',
+//                                       headers: { authorization: token },
+//                                       timeoutMs: 5000 });
+//     resp.status / resp.reason / resp.headers / resp.body(Buffer)
+//     resp.peerIp / resp.boundIfIndex / resp.pinMethod
+//     await http.close();
+//
+//   WS —— 长连接，用 EventEmitter（与 SMP 的 Connection 一致）
+//     const ws   = ttsignal.createWsConnector({ vpnPolicy: 'force-physical' });
+//     const conn = ws.createConnection();
+//     conn.on('text', (s) => {});         conn.on('data', (buf) => {});
+//     conn.on('closed', (reason) => {});  conn.on('exception', (msg) => {});
+//     await conn.connect('wss://host/path', 5000);
+//     conn.sendText('hello'); conn.sendData(buf);
+//     await conn.close();
+//     await ws.close();
+//
+// `vpnPolicy: 'force-physical'` 的意义：绕开 VPN / 虚拟网卡，用**用户真实 IP**
+// 出网（业务侧最典型的用途是请求接入点接口，避免在 VPN 环境下被调度到错误地域
+// 的节点）。是否真的绑上了物理网卡，看 `resp.boundIfIndex` /
+// `connect()` 的返回值 / `conn.info().boundIfIndex`：非 0 就是真的绑了，
+// `pinMethod` 说明绑法（macOS/iOS 是 IP_BOUND_IF，Linux 是 SO_BINDTODEVICE），
+// 不用翻日志。
+//
+// ------------------------------------------------------------------------------
+// 一、错误对象：result / errName / errMessage 一个都不能丢
+// ------------------------------------------------------------------------------
+// reject 出来的就是原生层给的那个 Error，**原样透传**，不重新包装：
+//   err.result      数字错误码（BCRESULT，跨语言契约值）
+//   err.errName     错误码符号名，如 'BC_R_ROUTE_MISMATCH'
+//   err.errMessage  原生层的现场描述 —— force-physical 失败时这段写得很细，
+//                   包含对端 IP、peerClass、内核把包判给了哪块网卡、以及该怎么
+//                   改配置。**排查 force-physical 只能看这一段**，通用提示给不出
+//                   这些细节。
+// 常用取值（见 CONST 里的 TTS_R_* 常量）：
+//   64 BC_R_NO_PHYSICAL_INTERFACE  当下没有可用物理网卡
+//   69 BC_R_PIN_FAILED             绑定网卡失败
+//   70 BC_R_ROUTE_MISMATCH         对端从物理网卡出不去（连环回/内网即是这个）
+//   71 BC_R_DNS_FAILED             DNS 失败
+//   72 BC_R_TLS_VERIFY_FAILED      证书校验失败
+//   73 BC_R_RESPONSE_TOO_LARGE     响应超过 maxResponseBytes（仅 HTTP）
+//   74 BC_R_WS_HANDSHAKE_FAILED    WebSocket 握手失败（仅 WS）
+// ⚠️ 发送失败（sendText / sendData / sendPing）抛出的 Error 只有 result，没有
+// errName / errMessage —— 原生的发送接口只给错误码，不给文案。
+//
+// ------------------------------------------------------------------------------
+// 二、监听器 / Promise 回调里抛异常
+// ------------------------------------------------------------------------------
+// `emit` 是**同步**调用监听器的，而这些 emit 发生在原生回调（uv_async）栈里。
+// 监听器抛出的异常若原样冒回 C++，会在 env 里留下 pending exception，同一批
+// uv_async 的下一个事件就会让 C++ 异常逃出事件泵 -> `libc++abi: terminating`，
+// **打死整个 node 进程**。原生层已经用 DrainPendingException() 兜住了这一层
+// （会报成 uncaughtException），本胶水层再兜一道：所有 emit 都走 ttEmitSafely，
+// 监听器抛出的异常被就地捕获、挪到 process.nextTick 再抛出去。效果是：
+//   * 进程不死，异常照常出现在 process 的 'uncaughtException' 上（不会被吞掉）；
+//   * 同一批里的其余事件、以及后续事件，都照常交付。
+// 同理，Promise 的 resolve / reject 之后本胶水层**不再执行任何业务代码** ——
+// then/catch 里的用户代码同样是同步跑在原生回调栈上的。
+//
+// ------------------------------------------------------------------------------
+// 三、close()
+// ------------------------------------------------------------------------------
+// * `connector.close()` 可以重复调，**每一次**返回的 Promise 都会 settle
+//   （原生层把 close 回调收成列表，且已关闭后仍会补一次信号）。
+// * `conn.close()` 在"握手成功过"的连接上等 closed 事件；对**从没握手成功过**
+//   的连接（没 connect 过、connect 失败、还在连接中）立刻 resolve —— 那种连接
+//   按 WSConnector.h 契约第 2 条永远不会有 closed 事件，等下去就是永远悬着。
+// * 连接器关闭时，还悬着的 `conn.close()` 一并 resolve（~WSConnector 的放弃路径
+//   下 closed 永远不会来）。
+//
+// ------------------------------------------------------------------------------
+// 四、生命周期：用完**显式** close()，别指望 GC
+// ------------------------------------------------------------------------------
+// * HttpConnector / WsConnector 的析构会等在途回调跑完，**最多阻塞主线程
+//   drainTimeoutMs**（默认 30 秒）。显式 close() 是异步等待，不占主线程。
+// * 业务应当**复用连接器单例**，不要按请求建连接器：每个连接器都会装一个日志
+//   appender，还各自带一份 DNS / TLS 上下文。
+// * 一条 WsConnection 只能 connect 一次（第二次当场抛）。重连 = 新建连接。
+// * `logFile` 与 `log_callback` 同时给时 **logFile 优先，log_callback 一条都不会
+//   触发**（原生层给了 logFile 就只装文件 appender）。这里会 emitWarning 提醒。
+//
+// ------------------------------------------------------------------------------
+// 五、hasPathMonitor
+// ------------------------------------------------------------------------------
+// `connector.info().hasPathMonitor` 报的是**编译期**有没有 TT_HAS_PATH_MONITOR。
+// 为 false 说明这个 .node 把网卡绑定整段条件编译掉了：`prefer-physical` 会静默
+// 回落系统路由（= VPN 隧道），`force-physical` 则硬失败 64。它就是为了让"构建
+// 配置悄悄把绑定关掉"这类缺陷在任何跑得起来的产物上当场露馅 —— 生产前建议断言
+// 它为 true。
 //*******************************************************************************
 
-exports.ttsignal = ttsignal;
+const VPN_POLICIES = ['os', 'prefer-physical', 'force-physical'];
+
+// 供业务比对 err.result 用。原生层原样透传 BCRESULT，这里只是给几个常用码起个名，
+// 免得业务里到处写魔法数字。
+const HTTP_WS_ERRORS = {
+    TTS_R_NO_PHYSICAL_INTERFACE : 64,
+    TTS_R_PIN_FAILED            : 69,
+    TTS_R_ROUTE_MISMATCH        : 70,
+    TTS_R_DNS_FAILED            : 71,
+    TTS_R_TLS_VERIFY_FAILED     : 72,
+    TTS_R_RESPONSE_TOO_LARGE    : 73,
+    TTS_R_WS_HANDSHAKE_FAILED   : 74
+};
+copyProperties(ttsignal, HTTP_WS_ERRORS);
+
+/**
+ * 安全 emit：监听器抛出的异常挪到下一个 tick 再抛。
+ *
+ * emit 是同步的，而这些 emit 跑在原生回调栈上；异常原样冒回 C++ 会留下 pending
+ * exception，同一批 uv_async 的下一个事件就会把整个进程打死。挪到 nextTick 抛的
+ * 效果是：异常照常出现在 'uncaughtException'（不吞），但不经过 C++ 栈。
+ *
+ * @private
+ */
+function ttEmitSafely(target, type) {
+    const args = Array.prototype.slice.call(arguments, 1);
+    try {
+        target.emit.apply(target, args);
+    } catch (err) {
+        process.nextTick(function () { throw err; });
+    }
+}
+
+/**
+ * 校验并返回一份可以交给原生层的 config。
+ *
+ * vpnPolicy 拼错在 JS 层就抛：原生层虽然也会抛，但在这里抛能把"合法取值"直接
+ * 写进异常文案，且与 createConnector 的既有行为一致。
+ *
+ * @private
+ */
+function ttNormalizeStackConfig(config, what) {
+    if (config === undefined || config === null) {
+        config = {};
+    }
+    if (typeof config !== 'object') {
+        throw Error('Invalid config for ' + what + ': expected an object.');
+    }
+    if (config.vpnPolicy !== undefined && config.vpnPolicy !== null) {
+        if (VPN_POLICIES.indexOf(config.vpnPolicy) === -1) {
+            throw Error('Invalid vpnPolicy: ' + config.vpnPolicy +
+                '. Expected one of ' + VPN_POLICIES.join(', ') + '.');
+        }
+    }
+    // logFile 与 log_callback 互斥且 logFile 优先。静默丢掉 log_callback 是很难
+    // 察觉的（业务只会看到"一条日志都没来"），所以出个警告。
+    if (config.logFile && typeof config.log_callback === 'function') {
+        process.emitWarning(
+            '[ttsignal] ' + what + ': logFile 与 log_callback 同时给了，' +
+            'logFile 优先，log_callback 一条都不会触发。', 'TTSignalConfigWarning');
+    }
+    return config;
+}
+
+/** 原生产物不含 HTTP/WS 栈时给一句能看懂的话，而不是 "xxx is not a function"。 */
+function ttRequireStack(factoryName, what) {
+    if (typeof ttsignal[factoryName] !== 'function') {
+        throw Error('当前 ttsignal 原生产物不含 ' + what + '（缺少 ' +
+            factoryName + '）。请重新构建 addon（见 CLAUDE.md 的 Build Commands）。');
+    }
+}
+
+/*******************************************************************************
+* @class ttsignal.HttpConnector
+*
+* 一次性 HTTP/HTTPS 请求。**复用单例**，用完 await close()。
+*******************************************************************************/
+
+if (typeof ttsignal.HttpConnector === 'function') {
+
+inherits(ttsignal.HttpConnector, EventEmitter);
+
+/**
+ * @method _internalCallback
+ * @private
+ **/
+ttsignal.HttpConnector.prototype._internalCallback = function (type) {
+    switch (type) {
+    case 'close':
+        // 原生层每次 __close__ 都会给一次信号（已关闭时补投一个事件），但对外的
+        // 'close' 事件按 Node 惯例只发一次。
+        if (this.__closeEmitted) {
+            break;
+        }
+        this.__closeEmitted = true;
+        ttEmitSafely(this, 'close');
+        break;
+    }
+};
+
+/**
+ * 发起一次请求。
+ *
+ * @method request
+ * @public
+ * @async
+ * @param options {Object} 请求参数
+ * @param options.url {String} 必填，http:// 或 https://
+ * @param options.method {String=} 默认 GET
+ * @param options.headers {Object=} 头，值必须是字符串；含 CRLF 会被当注入拦下
+ * @param options.body {String|Buffer=} 请求体
+ * @param options.timeoutMs {Number=} 覆盖 DNS + connect + TLS + 收响应的总预算
+ * @param options.resolvedIp {String=} 跳过 DNS，直接连这个 IP
+ * @return {Promise<Object>} resolve：{ status, reason, headers, body(Buffer),
+ *   peerIp, boundIfIndex, pinMethod }；4xx / 5xx 也算正常响应（resolve）。
+ *   reject：原生 Error，带 result / errName / errMessage。
+ *
+ * ⚠️ 参数用错（缺 url、类型不对）同样是 **reject**，不是同步抛 —— 一个既可能
+ * 同步抛又可能异步 reject 的 async 接口是经典的坑。那类错误没有 result 字段。
+ * ⚠️ resolve 之后不要在 then 里做耗时的事：then 的回调是同步跑在原生回调栈上的。
+ *
+ * @example
+ *     const resp = await http.request({ url: 'https://ipinfo.io/ip' });
+ *     console.log(resp.status, resp.body.toString('utf8'), resp.boundIfIndex);
+ **/
+ttsignal.HttpConnector.prototype.request = function (options) {
+    const self = this;
+    return new Promise(function (resolve, reject) {
+        // __request__ 的同步抛（参数校验）会被 Promise 构造器转成 reject。
+        self.__request__(options, function (err, resp) {
+            if (err) {
+                reject(err);        // 原样透传：result / errName / errMessage 都在
+                return;
+            }
+            resolve(resp);
+        });
+        // ⚠️ resolve / reject 之后不要再写业务代码。
+    });
+};
+
+/**
+ * 关闭连接器。可以重复调，每一次的 Promise 都会 settle。
+ *
+ * 在途请求会被 reject（不会悬着）。**用完一定要显式调**：靠 GC 的话析构会在主
+ * 线程上等在途回调收尾，最多阻塞 drainTimeoutMs。
+ *
+ * @method close
+ * @public
+ * @async
+ * @return {Promise<void>}
+ **/
+ttsignal.HttpConnector.prototype.close = function () {
+    const self = this;
+    return new Promise(function (resolve) {
+        self.__close__(resolve);
+    });
+};
+
+/**
+ * 生效配置与运行期状态的只读快照。**形状恒定**，关闭之后字段一个不少。
+ *
+ * @method info
+ * @public
+ * @return {Object} { closed, vpnPolicy, pendingRequests, maxResponseBytes,
+ *   drainTimeoutMs, maxIdleConnections, idleTimeoutMs, hasPathMonitor }
+ *   hasPathMonitor 为 false = 这个产物把网卡绑定条件编译掉了，见本节文档第五条。
+ **/
+ttsignal.HttpConnector.prototype.info = function () {
+    return this.__info__();
+};
+
+/**
+ * 运行期调整 keep-alive 空闲连接的存活上限。
+ *
+ * 0 = 不设本地超时，完全听服务端的。上限 24 小时（越界夹住并打 WARN）。
+ * 连接器已关闭时静默忽略（与 close() 的幂等语义一致）。
+ *
+ * ⚠️ 只影响**此后**归还入池的连接：已经躺在池里的那些仍按各自入池时的时长
+ * 计时。要让新值立刻对全部连接生效，改完再重建连接器。
+ *
+ * @method setIdleTimeoutMs
+ * @public
+ * @param ms {Number} 毫秒，0 .. 4294967295。非数字抛 TypeError，越界抛 RangeError
+ * @example
+ *     const http = ttsignal.createHttpConnector();
+ *     http.setIdleTimeoutMs(5 * 60 * 1000);   // 空闲 5 分钟就收
+ *     console.log(http.info().idleTimeoutMs); // 300000
+ **/
+ttsignal.HttpConnector.prototype.setIdleTimeoutMs = function (ms) {
+    this.__setIdleTimeoutMs__(ms);
+};
+
+}   // typeof ttsignal.HttpConnector === 'function'
+
+/*******************************************************************************
+* @class ttsignal.WsConnector / ttsignal.WsConnection
+*******************************************************************************/
+
+if (typeof ttsignal.WsConnector === 'function' &&
+    typeof ttsignal.WsConnection === 'function') {
+
+inherits(ttsignal.WsConnector, EventEmitter);
+inherits(ttsignal.WsConnection, EventEmitter);
+
+/**
+ * 把还悬着的 conn.close() Promise 收掉。重复 resolve 是无害的（Promise 幂等），
+ * 所以同一个 resolver 同时登记在连接和连接器两处也没问题。
+ *
+ * @private
+ */
+function ttDrainCloseWaiters(conn) {
+    const waiters = conn.__closeWaiters;
+    if (!waiters || waiters.length === 0) {
+        return;
+    }
+    conn.__closeWaiters = [];
+    const connector = conn.__connector;
+    for (let i = 0; i < waiters.length; i++) {
+        if (connector && connector.__connCloseWaiters) {
+            connector.__connCloseWaiters.delete(waiters[i]);
+        }
+        waiters[i]();
+    }
+}
+
+/**
+ * @method _internalCallback
+ * @private
+ **/
+ttsignal.WsConnector.prototype._internalCallback = function (type, arg) {
+    switch (type) {
+    case 'close':
+        // 连接器收尾了 -> 不会再有任何事件进来。还悬着的 conn.close() 必须在这里
+        // 收掉：~WSConnector 的放弃路径下 closed 事件永远不会来。
+        if (this.__connCloseWaiters) {
+            const waiters = Array.from(this.__connCloseWaiters);
+            this.__connCloseWaiters.clear();
+            for (let i = 0; i < waiters.length; i++) {
+                waiters[i]();
+            }
+        }
+        if (!this.__closeEmitted) {
+            this.__closeEmitted = true;
+            ttEmitSafely(this, 'close');
+        }
+        break;
+    case 'exception':
+        ttEmitSafely(this, 'exception', arg);
+        break;
+    }
+};
+
+/**
+ * 建一条连接（还没发起，需要再调 conn.connect()）。
+ *
+ * @method createConnection
+ * @public
+ * @param config {Object=} 连接级配置，逐键覆盖连接器的默认值。常用键：
+ *   vpnPolicy / connectTimeoutMs / pingIntervalMs / idleTimeoutMs / maxFrameBytes /
+ *   caCerts / spkiPin / insecureSkipVerify / dnsServers / dnsTimeoutMs
+ * @return {ttsignal.WsConnection}
+ **/
+ttsignal.WsConnector.prototype.createConnection = function (config) {
+    const conn = this.__createConnection__(
+        config === undefined || config === null ? undefined :
+            ttNormalizeStackConfig(config, 'createConnection'));
+    // 连接反指连接器，用来在连接器关闭时兜底 settle 还悬着的 conn.close()。
+    // 方向是单向的（连接 -> 连接器）：连接器只存 resolver 闭包，**不存连接对象
+    // 本身**，免得连接器反过来强引用它的连接、把 GC 挡住。
+    Object.defineProperty(conn, '__connector', {
+        value: this, enumerable: false, writable: false, configurable: true
+    });
+    return conn;
+};
+
+/**
+ * 关闭连接器。可以重复调，每一次的 Promise 都会 settle。
+ *
+ * 在途连接会被 settle（connect 的 Promise reject），已连上的连接会收到 closed。
+ * **用完一定要显式调**：靠 GC 的话析构会在主线程上等在途回调收尾，最多阻塞
+ * drainTimeoutMs。
+ *
+ * @method close
+ * @public
+ * @async
+ * @return {Promise<void>}
+ **/
+ttsignal.WsConnector.prototype.close = function () {
+    const self = this;
+    return new Promise(function (resolve) {
+        self.__close__(resolve);
+    });
+};
+
+/**
+ * 生效配置与运行期状态的只读快照。**形状恒定**，关闭之后字段一个不少。
+ *
+ * @method info
+ * @public
+ * @return {Object} { closed, connections, vpnPolicy, drainTimeoutMs,
+ *   hasPathMonitor }
+ **/
+ttsignal.WsConnector.prototype.info = function () {
+    return this.__info__();
+};
+
+/**
+ * 连接统计。关闭之后报的是最后一次快照（关完正是最想看统计的时候）。
+ *
+ * @method stats
+ * @public
+ * @return {Object} { allocated_conn_size, active_conn_size,
+ *   handshake_failed_size, ... }
+ **/
+ttsignal.WsConnector.prototype.stats = function () {
+    return this.__stats__();
+};
+
+/**
+ * @method _internalCallback
+ * @private
+ **/
+ttsignal.WsConnection.prototype._internalCallback = function (type, arg) {
+    switch (type) {
+    case 'text':
+        ttEmitSafely(this, 'text', arg);
+        break;
+    case 'data':
+        ttEmitSafely(this, 'data', arg);
+        break;
+    case 'closed':
+        this.__closedSeen = true;
+        // 先 emit 再收 Promise：业务的 closed 监听器应当在 await close() 返回之前
+        // 跑完（emit 是同步的，close() 的 Promise 只能在微任务里继续）。
+        ttEmitSafely(this, 'closed', arg);
+        ttDrainCloseWaiters(this);
+        break;
+    case 'exception':
+        ttEmitSafely(this, 'exception', arg);
+        break;
+    }
+};
+
+/**
+ * 发起连接。**一条连接只能 connect 一次**（第二次当场抛），重连 = 新建连接。
+ *
+ * 没有 connectResult 事件 —— 那是"恰好一次"的语义，Promise 才是自然形态。
+ *
+ * @method connect
+ * @public
+ * @async
+ * @param url {String} ws:// 或 wss://
+ * @param timeoutMs {Number=} DNS + connect + TLS + 握手响应的总预算，0 / 不给则
+ *   用配置里的 connectTimeoutMs（默认 10 秒）
+ * @return {Promise<Object>} resolve：{ headers, peerIp, boundIfIndex, pinMethod }。
+ *   reject：原生 Error，带 result / errName / errMessage。
+ *
+ * ⚠️ 握手失败与"连上之后被关闭"是可区分的：握手失败**只有** reject，**不会**有
+ * closed 事件；握手成功过的连接一定先 resolve、之后某个时刻才 closed。业务的重连
+ * 逻辑可以据此分支。
+ *
+ * @example
+ *     const ok = await conn.connect('wss://sfu.example.com/signal', 5000);
+ *     console.log(ok.peerIp, ok.boundIfIndex, ok.pinMethod);
+ **/
+ttsignal.WsConnection.prototype.connect = function (url, timeoutMs) {
+    const self = this;
+    return new Promise(function (resolve, reject) {
+        // __connect__ 的同步抛（参数校验 / 重复 connect）会被 Promise 构造器转成
+        // reject —— 与 HttpConnector.request 一致。
+        self.__connect__(url, timeoutMs === undefined || timeoutMs === null ?
+                         0 : timeoutMs, function (err, info) {
+            if (err) {
+                reject(err);        // 原样透传：result / errName / errMessage 都在
+                return;
+            }
+            resolve(info);
+        });
+        // ⚠️ resolve / reject 之后不要再写业务代码。
+    });
+};
+
+/**
+ * 发送一个文本帧。
+ *
+ * @method sendText
+ * @public
+ * @sync
+ * @param text {String}
+ * @throws {Error} 发送失败时抛出，err.result 是原生错误码（没有 errName /
+ *   errMessage —— 原生发送接口只给码）。**刻意抛而不是返回错误码**：返回码没人看
+ *   就是静默丢消息，而 WebSocket 标准里对未 OPEN 的连接 send 也是抛的。想避开
+ *   try/catch 就订阅 'closed' 事件、或看 conn.info().closed。
+ **/
+ttsignal.WsConnection.prototype.sendText = function (text) {
+    ttThrowIfSendFailed(this.__sendText__(text), 'sendText');
+};
+
+/**
+ * 发送一个二进制帧。
+ *
+ * @method sendData
+ * @public
+ * @sync
+ * @param data {Buffer}
+ * @throws {Error} 同 sendText
+ **/
+ttsignal.WsConnection.prototype.sendData = function (data) {
+    ttThrowIfSendFailed(this.__sendData__(data), 'sendData');
+};
+
+/**
+ * 发一个 ping（对端的 pong 由原生层静默吃掉，不产生事件）。
+ * 一般不用手动调：连接级 pingIntervalMs 会自动保活。
+ *
+ * @method sendPing
+ * @public
+ * @sync
+ * @throws {Error} 同 sendText
+ **/
+ttsignal.WsConnection.prototype.sendPing = function () {
+    ttThrowIfSendFailed(this.__sendPing__(), 'sendPing');
+};
+
+/** @private */
+function ttThrowIfSendFailed(result, what) {
+    if (result === 0) {
+        return;
+    }
+    const err = Error(what + ' failed: result=' + result +
+        '（连接可能已关闭或还没连上；订阅 closed 事件或看 conn.info()）');
+    err.result = result;
+    throw err;
+}
+
+/**
+ * 关闭这条连接。幂等；可以重复调，每一次的 Promise 都会 settle。
+ *
+ * @method close
+ * @public
+ * @async
+ * @param reason {Number=} 可选的关闭原因码（BCRESULT），给了非法值按正常关闭处理
+ * @return {Promise<void>} 握手成功过的连接：closed 事件到达时 resolve。从没握手
+ *   成功过的连接（没 connect 过 / connect 失败 / 还在连接中）：立刻 resolve ——
+ *   那种连接按契约永远不会有 closed 事件，等下去就是永远悬着。连接器被关闭时，
+ *   还悬着的 Promise 一并 resolve。
+ **/
+ttsignal.WsConnection.prototype.close = function (reason) {
+    const info = this.__info__();
+    this.__close__(reason);
+    if (this.__closedSeen || info.closed || !info.upgraded) {
+        return Promise.resolve();
+    }
+    const self = this;
+    return new Promise(function (resolve) {
+        if (!self.__closeWaiters) {
+            self.__closeWaiters = [];
+        }
+        self.__closeWaiters.push(resolve);
+        // 连接器关闭时的兜底（放弃路径下 closed 永远不来）。只登记 resolver，
+        // 不登记连接对象本身。
+        const connector = self.__connector;
+        if (connector) {
+            if (!connector.__connCloseWaiters) {
+                connector.__connCloseWaiters = new Set();
+            }
+            connector.__connCloseWaiters.add(resolve);
+        }
+    });
+};
+
+/**
+ * 这条连接的只读快照。**形状恒定**，关闭之后字段一个不少。
+ *
+ * @method info
+ * @public
+ * @return {Object} { id, attached, connecting, upgraded, closed, peerIp,
+ *   boundIfIndex, pinMethod, lastError, hasPathMonitor }
+ *   lastError 是原生给的最后一段失败现场描述（connectResult 的 err 只出现那一次，
+ *   事后复查就看这里）。
+ **/
+ttsignal.WsConnection.prototype.info = function () {
+    return this.__info__();
+};
+
+}   // typeof ttsignal.WsConnector === 'function' && ...
+
+/**
+ * 创建 HTTP 连接器。**复用单例**，不要按请求建。
+ *
+ * @method createHttpConnector
+ * @public
+ * @param config {Object=} 配置
+ * @param config.vpnPolicy {String=} 'os' | 'prefer-physical' | 'force-physical'。
+ *   默认按平台（macOS / Windows / Linux 是 'prefer-physical'）。
+ *   'force-physical' = 只走物理网卡、绝不回落，用户真实 IP 出网；出不去就失败，
+ *   错误码与现场描述见本节文档第一条。
+ * @param config.logLevel {Number=} 1 DEBUG ... 5 FATAL
+ * @param config.logFile {String=} 日志文件；给了它 log_callback 就不会触发
+ * @param config.log_callback {Function=} (level, msg) => {}
+ * @param config.caCerts {String=} 额外信任的 PEM
+ * @param config.spkiPin {String=} SPKI pin
+ * @param config.insecureSkipVerify {Boolean=} 跳过证书校验（别在生产用）
+ * @param config.maxResponseBytes {Number=} 响应上限，超了报 73
+ * @param config.drainTimeoutMs {Number=} 关闭时等在途请求的上限
+ * @param config.dnsServers {String=} / @param config.dnsTimeoutMs {Number=}
+ * @param config.idleTimeoutMs {Number=} 空闲连接在池里躺多久没人用就自行关掉，
+ *   默认 3600000（60 分钟），上限 86400000（24 小时）。每次归还重新计时。
+ *   **0 = 不设本地超时**，完全听服务端的。运行期可用 `setIdleTimeoutMs()` 改。
+ *   它是一道兜底：正常情况下服务端自己的 keep-alive 超时会先把连接收走，这里
+ *   只负责挡住「永不主动关连接」的服务端把 fd 长期占住。
+ * @param config.maxIdleConnections {Number=} keep-alive 连接池里每个目标
+ *   （host+port+tls+网卡策略）最多囤几条空闲连接，默认 4，上限 64。
+ *   **0 = 关掉复用**，退回「一次请求一条连接」并显式发 Connection: close。
+ *   默认开着复用：同一个 connector 连发多条请求时，第二条起省掉 TCP 握手和
+ *   整套 TLS 握手（实测同一 https 端点 280ms -> 95ms）。要吃到这个收益就得
+ *   **复用同一个 connector**，每条请求现建一个等于没开。
+ * @return {ttsignal.HttpConnector}
+ * @example
+ *     const http = ttsignal.createHttpConnector({ vpnPolicy: 'force-physical' });
+ *     try {
+ *         const resp = await http.request({ url: 'https://ipinfo.io/ip' });
+ *     } finally {
+ *         await http.close();
+ *     }
+ **/
+ttsignal.createHttpConnector = function (config) {
+    ttRequireStack('__createHttpConnector__', 'HTTP 栈');
+    return ttsignal.__createHttpConnector__(
+        ttNormalizeStackConfig(config, 'createHttpConnector'));
+};
+
+/**
+ * 创建 WebSocket 连接器。**复用单例**，一个连接器可以开多条连接。
+ *
+ * @method createWsConnector
+ * @public
+ * @param config {Object=} 配置。除 createHttpConnector 那几项（vpnPolicy /
+ *   logLevel / logFile / log_callback / caCerts / spkiPin / insecureSkipVerify /
+ *   drainTimeoutMs / dnsServers / dnsTimeoutMs）之外还有：
+ *   connectTimeoutMs / pingIntervalMs / idleTimeoutMs / maxFrameBytes /
+ *   clientCertFile / clientKeyFile / clientKeyPassword。
+ *   这些键在 createConnection(config) 里可以逐条覆盖。
+ * @return {ttsignal.WsConnector}
+ * @example
+ *     const ws = ttsignal.createWsConnector({ vpnPolicy: 'force-physical' });
+ *     const conn = ws.createConnection();
+ *     conn.on('data', (buf) => handle(buf));
+ *     await conn.connect('wss://sfu.example.com/signal', 5000);
+ **/
+ttsignal.createWsConnector = function (config) {
+    ttRequireStack('__createWsConnector__', 'WebSocket 栈');
+    return ttsignal.__createWsConnector__(
+        ttNormalizeStackConfig(config, 'createWsConnector'));
+};
+
+
+//*******************************************************************************
+// Exports :
+//
+// 历史形态是 `exports.ttsignal = ttsignal`，于是 `require('ttsignal')` 拿到的是一层
+// 包装对象 —— `require('ttsignal').createConnector` 是 undefined。仓库里 js/client.js
+// / js/server.js / js/getLogFile.js / js/upload-livekit-bin.js 等示例脚本正是那么写
+// 的，一直跑不起来（既有问题，不是本次引入的）。这里把**模块本身**导出，并保留一个
+// 不可枚举的 `.ttsignal` 自引用，两种写法都成立：
+//
+//   const tts = require('ttsignal');            // tts.createConnector / createHttpConnector
+//   const { ttsignal } = require('ttsignal');   // 旧写法（js/pathChange.js），仍然可用
+//
+// 这是一次**放宽**，不是替换：旧调用方读到的 `.ttsignal` 还是同一个对象。
+// rtc-client 的 src/signaling/ttsignal-module.ts 做的正是 `wrapped.ttsignal ?? wrapped`，
+// 两种形态都吃，所以对它没有影响。自引用设为不可枚举，避免 console.dir / 遍历导出对象
+// 时多出一层环。
+//*******************************************************************************
+
+module.exports = ttsignal;
+Object.defineProperty(module.exports, 'ttsignal', {
+    value: ttsignal, enumerable: false, writable: true, configurable: true
+});
 
 //*******************************************************************************
 // End of file : ttsignal.js

@@ -39,7 +39,9 @@ struct Monitor {
     // Snapshot of TTNetworkMonitorOptions taken at start time; the caller
     // is free to reuse / destroy the struct it passed to us. immutable
     // after tt_netmon_start returns, no locking needed.
-    bool                    bypass_vpn   = true;
+    // 生效策略。由 tt_netmon_start 从 options->vpnPolicy 与 options->bypassVpn
+    // 合并得出，start 返回后不再变更，无需加锁。
+    TTVpnPolicy             policy       = TT_VPN_POLICY_PREFER_PHYSICAL;
     // Optional raw-event log sink (see TTNetworkMonitorOptions::rawLogFn).
     // Captured at start time so the update_handler block doesn't need to
     // re-read options across threads.
@@ -81,47 +83,48 @@ struct Monitor {
 // the kernel has the route installed.
 static constexpr int64_t kDebounceMs = 1500;
 
-// Pick the interface to bind QUIC sockets to. Network.framework hands us
-// the interfaces in OS preference order (default-route winner first).
-// NWPathMonitor does NOT give us nw_interface_get_index directly on
-// iOS 12 — if_nametoindex on the name is equivalent and is what the
-// system itself uses internally.
+// 挑选 QUIC socket 要绑定的网卡。Network.framework 按系统偏好顺序（默认路由
+// 赢家在前）把网卡交给我们。NWPathMonitor 在 iOS 12 上不直接给
+// nw_interface_get_index，用 if_nametoindex 取名字换索引是等价的，系统内部
+// 也是这么做的。
 //
-// `physicalOnly`:
-//   true   — return 0 when the path contains no physical
-//            (wifi / wired / cellular) interface. Used by the live
-//            update_handler so that a transient gap during a Wi-Fi
-//            handover (path momentarily contains only utun4) does NOT
-//            bounce our socket onto a VPN tunnel whose underlying link
-//            just went down. We keep the current socket; the next
-//            update (real Wi-Fi back, or cellular kicking in) will
-//            commit a clean migration.
-//   false  — allow the utun / ipsec / ppp fallback. Used by the
-//            startup query (`tt_netmon_query_default_ifindex`) so a
-//            VPN-only machine can still bootstrap a connection.
+// macOS 与 iOS 共用这一份实现。它们的差别只体现在默认 policy 上
+// （见 tt_vpn_policy_platform_default）：iOS 默认 os，桌面默认
+// prefer-physical。行为本身由参数决定，不再按 #if TARGET_OS_OSX 分叉。
 //
-// macOS and iOS get different strategies on purpose; see the per-#if
-// branch comments below.
+// policy 决定"物理优先"和"能否回落到隧道"两件事：
+//
+//   TT_VPN_POLICY_OS
+//       完全跟随系统顺序，第一块非 loopback 网卡胜出（含 utun / ipsec /
+//       ppp）。iOS 的历史行为，也是 iOS 的默认值——装了 per-app VPN 的
+//       用户通常就是希望流量走 VPN。
+//
+//   TT_VPN_POLICY_PREFER_PHYSICAL
+//       遍历整条 path，优先挑第一块物理网卡（wifi / wired / cellular）。
+//       找不到物理网卡时：启动查询允许回落到隧道（VPN-only 机器还得能
+//       bootstrap），运行中的 update_handler 不回落而是返回 0。
+//
+//       为什么运行中不回落：Wi-Fi 切换过程中 path 常常有几百毫秒只剩
+//       utun4，这时把 socket 弹到隧道上只会打死连接（底下的物理链路同时
+//       也断了）。返回 0 让 update_handler 保持当前 socket，下一次带着
+//       真实物理网卡的更新再提交迁移。
+//
+//   TT_VPN_POLICY_FORCE_PHYSICAL
+//       只接受物理网卡，启动查询也不回落。业务显式声明"必须拿到真实 IP"。
+//
+// 公司 VPN 客户端（Cisco、GlobalProtect）、Tailscale、WireGuard 和 iCloud
+// 私密代理都会装一块 nw_interface_type_other 的 utunN / ipsecN / ppp* 并
+// 抢走默认路由，这正是 prefer / force 两档要绕开的东西。
+//
+// isStartupQuery 只在 prefer-physical 下有意义：true 表示这是
+// tt_netmon_query_default_ifindex_ex 的一次性查询，允许回落隧道；false
+// 表示这是长期 monitor 的 live 更新，不允许。
 static int64_t ResolveActiveIfIndex(nw_path_t path,
                                     std::string& descOut,
                                     std::string& ifNameOut,
-                                    bool physicalOnly)
+                                    TTVpnPolicy policy,
+                                    bool isStartupQuery)
 {
-#if TARGET_OS_OSX
-    // macOS: explicit physical-first override.
-    //
-    // Corporate VPN clients, Tailscale, WireGuard and iCloud Private
-    // Relay all install a utunN / ipsecN / ppp* device of type
-    // nw_interface_type_other and steal the default route. With the OS
-    // ordering, NWPathMonitor then keeps flipping "best" between utun4
-    // and en0 across a Wi-Fi handover as the VPN tears down and
-    // re-establishes — which bounces our UDP socket twice per handover
-    // and opens silent-failure windows when the VPN drops packets but
-    // the kernel still reports the interface as up.
-    //
-    // Business decision: ttsignal traffic should not ride the VPN on
-    // desktop. Walk every interface in the path, pick the first
-    // physical-link one (wifi / wired / cellular).
     __block int64_t      physicalIdx  = 0;
     __block std::string  physicalDesc;
     __block std::string  physicalName;
@@ -129,6 +132,8 @@ static int64_t ResolveActiveIfIndex(nw_path_t path,
     __block int64_t      fallbackIdx  = 0;
     __block std::string  fallbackDesc;
     __block std::string  fallbackName;
+
+    const bool osOrder = (policy == TT_VPN_POLICY_OS);
 
     nw_path_enumerate_interfaces(path, ^bool(nw_interface_t iface) {
         const char* name = nw_interface_get_name(iface);
@@ -149,18 +154,27 @@ static int64_t ResolveActiveIfIndex(nw_path_t path,
         char buf[64];
         snprintf(buf, sizeof(buf), "%s (%s)", typeStr, name);
 
+        if (osOrder) {
+            // 系统顺序：第一块网卡直接胜出。loopback 永远跳过——绑到 lo0
+            // 上等于把连接打死，而且系统也不会把它排在默认路由赢家前面。
+            if (t == nw_interface_type_loopback) return true;
+            fallbackIdx  = (int64_t)idx;
+            fallbackName = name;
+            fallbackDesc = buf;
+            return false;
+        }
+
         if (isPhysical) {
             if (physicalIdx == 0) {
                 physicalIdx  = (int64_t)idx;
                 physicalName = name;
                 physicalDesc = buf;
             }
-            // First physical wins — short-circuit the enumeration.
+            // 第一块物理网卡胜出，提前结束枚举。
             return false;
         }
         if (t != nw_interface_type_loopback && fallbackIdx == 0) {
-            // VPN / tunnel. Remember as fallback; keep looking for a
-            // physical interface.
+            // VPN / 隧道。先记下来当备选，继续找物理网卡。
             fallbackIdx  = (int64_t)idx;
             fallbackName = name;
             fallbackDesc = buf;
@@ -168,13 +182,22 @@ static int64_t ResolveActiveIfIndex(nw_path_t path,
         return true;
     });
 
+    if (osOrder) {
+        descOut   = std::move(fallbackDesc);
+        ifNameOut = std::move(fallbackName);
+        return fallbackIdx;
+    }
+
     if (physicalIdx > 0) {
         descOut   = std::move(physicalDesc);
         ifNameOut = std::move(physicalName);
         return physicalIdx;
     }
-    if (physicalOnly) {
-        // Caller (live update_handler) opts out of the VPN fallback.
+
+    // 没有物理网卡。只有 prefer-physical 的启动查询允许回落到隧道。
+    const bool allowTunnelFallback =
+        (policy == TT_VPN_POLICY_PREFER_PHYSICAL && isStartupQuery);
+    if (!allowTunnelFallback) {
         descOut.clear();
         ifNameOut.clear();
         return 0;
@@ -182,47 +205,6 @@ static int64_t ResolveActiveIfIndex(nw_path_t path,
     descOut   = std::move(fallbackDesc);
     ifNameOut = std::move(fallbackName);
     return fallbackIdx;
-#else
-    // iOS / iPadOS / tvOS / watchOS: trust the OS preference order.
-    //
-    // On iOS the typical contenders are wifi <-> cellular <-> wired
-    // (USB tether) — utunN / ipsec interfaces only show up when the
-    // user has explicitly installed a VPN profile or per-app VPN, and
-    // in those cases the user *wants* the QUIC traffic to ride the VPN.
-    // The `physicalOnly` knob is therefore ignored here: iOS keeps the
-    // legacy "first interface wins" behaviour for both entry points.
-    (void)physicalOnly;
-    __block int64_t      ifIndex = 0;
-    __block std::string  desc;
-    __block std::string  ifName;
-
-    nw_path_enumerate_interfaces(path, ^bool(nw_interface_t iface) {
-        const char* name = nw_interface_get_name(iface);
-        if (!name || !name[0]) return true; // continue
-        unsigned int idx = if_nametoindex(name);
-        if (idx == 0) return true;
-        ifIndex = (int64_t)idx;
-        ifName  = name;
-
-        nw_interface_type_t t = nw_interface_get_type(iface);
-        const char* typeStr = "other";
-        switch (t) {
-            case nw_interface_type_wifi:     typeStr = "wifi";     break;
-            case nw_interface_type_cellular: typeStr = "cellular"; break;
-            case nw_interface_type_wired:    typeStr = "wired";    break;
-            case nw_interface_type_loopback: typeStr = "loopback"; break;
-            default: break;
-        }
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%s (%s)", typeStr, name);
-        desc = buf;
-        return false; // first interface wins
-    });
-
-    descOut   = std::move(desc);
-    ifNameOut = std::move(ifName);
-    return ifIndex;
-#endif
 }
 
 // Walk getifaddrs() and collect every non-loopback IPv4/IPv6 address bound
@@ -348,9 +330,18 @@ TTNetworkMonitorRef tt_netmon_start(const TTNetworkMonitorOptions* options,
     Monitor* self = new Monitor();
     self->callback = cb;
     self->userdata = userdata;
-    // NULL options preserves the historical default (bypass VPN). Apps
-    // that want OS-native behaviour explicitly pass bypassVpn=0.
-    self->bypass_vpn = (options == nullptr) || (options->bypassVpn != 0);
+    // options 为 NULL 时用平台默认策略（macOS 是 prefer-physical，等价于
+    // 历史上的 bypassVpn=1；iOS 是 os，等价于历史上"第一块网卡胜出"）。
+    // 给了 options 就走 vpnPolicy / bypassVpn 的合并规则。
+    if (options == nullptr) {
+        self->policy = tt_vpn_policy_platform_default();
+    } else {
+        self->policy = tt_vpn_policy_resolve(
+            (TTVpnPolicy)options->vpnPolicy,
+            /*hasBypassVpn=*/1, options->bypassVpn,
+            tt_vpn_policy_platform_default(),
+            /*outBothGiven=*/nullptr);
+    }
     if (options) {
         self->raw_log_fn  = options->rawLogFn;
         self->raw_log_ctx = options->rawLogCtx;
@@ -405,17 +396,14 @@ TTNetworkMonitorRef tt_netmon_start(const TTNetworkMonitorOptions* options,
 
         std::string desc;
         std::string ifName;
-        // Live updates: when bypass_vpn is on (the default) refuse the
-        // utun/ipsec/ppp fallback. A transient gap during Wi-Fi handover
-        // often leaves only utun4 in the path for ~hundreds of ms;
-        // bouncing QUIC onto that tunnel just kills the connection (the
-        // underlying physical link is gone too). Returning 0 here keeps
-        // the current socket; the next NWPathMonitor update with a real
-        // physical interface will commit the migration. Apps that
-        // explicitly want to ride a VPN (bypassVpn=0) get the OS
-        // preference order untouched.
+        // Live 更新：prefer / force 两档都拒绝 utun/ipsec/ppp 回落。Wi-Fi
+        // 切换过程中 path 常常有几百毫秒只剩 utun4，把 QUIC 弹到那条隧道
+        // 上只会打死连接（底下的物理链路同时也断了）。此时
+        // ResolveActiveIfIndex 返回 0，我们保持当前 socket，等下一次带着
+        // 真实物理网卡的更新再提交迁移。os 档则拿到系统偏好顺序的原样结果。
         int64_t ifIndex = ResolveActiveIfIndex(path, desc, ifName,
-                                               /*physicalOnly=*/self->bypass_vpn);
+                                               self->policy,
+                                               /*isStartupQuery=*/false);
         if (ifIndex <= 0) return;
 
         std::string ips = CollectInterfaceIPs(ifName);
@@ -526,6 +514,19 @@ void tt_netmon_stop(TTNetworkMonitorRef ref)
 
 int64_t tt_netmon_query_default_ifindex(void)
 {
+    return tt_netmon_query_default_ifindex_ex(
+        (int)tt_vpn_policy_platform_default());
+}
+
+int64_t tt_netmon_query_default_ifindex_ex(int vpnPolicy)
+{
+    TTVpnPolicy policy = (TTVpnPolicy)vpnPolicy;
+    if (policy != TT_VPN_POLICY_OS &&
+        policy != TT_VPN_POLICY_PREFER_PHYSICAL &&
+        policy != TT_VPN_POLICY_FORCE_PHYSICAL) {
+        policy = tt_vpn_policy_platform_default();
+    }
+
     // Spin a one-shot path monitor synchronously. NWPathMonitor's first
     // update fires almost immediately on dispatch, but it's still async, so
     // we block on a semaphore with a small timeout. Returning 0 (unknown)
@@ -548,12 +549,13 @@ int64_t tt_netmon_query_default_ifindex(void)
         }
         std::string desc;
         std::string ifName;
-        // Bootstrap query: VPN-only machines (no wifi/wired/cellular at
-        // all) still need an ifIndex to connect from, so allow the
-        // utun/ipsec fallback here. The live update_handler will tighten
-        // up later by demanding a physical interface.
+        // 启动查询：prefer-physical 下允许 utun/ipsec 回落，这样纯 VPN
+        // 机器（完全没有 wifi/wired/cellular）也能拿到一个 ifIndex 把连接
+        // 建起来；live update_handler 之后会收紧成"必须物理网卡"。
+        // force-physical 下则不回落，返回 0 让上层明确失败。
         result = ResolveActiveIfIndex(path, desc, ifName,
-                                      /*physicalOnly=*/false);
+                                      policy,
+                                      /*isStartupQuery=*/true);
         dispatch_semaphore_signal(sem);
     });
     nw_path_monitor_start(mon);

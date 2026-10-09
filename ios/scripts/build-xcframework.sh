@@ -212,7 +212,8 @@ merge_archive "${DEVICE_FAT}" arm64 ios iphoneos \
     "${DEVICE_DEPS}/libjquic.a" \
     "${DEVICE_DEPS}/libssl.a" \
     "${DEVICE_DEPS}/libcrypto.a" \
-    "${DEVICE_DEPS}/libenv.a"
+    "${DEVICE_DEPS}/libenv.a" \
+    "${DEVICE_DEPS}/libllhttp.a"
 
 # Simulator slice is a fat binary (arm64 + x86_64). Build per-arch unified
 # archives first, then `lipo -create` them.
@@ -224,13 +225,15 @@ merge_archive "${SIM_ARM_FAT}" arm64 ios-simulator iphonesimulator \
     "${SIM_ARM_DEPS}/libjquic.a" \
     "${SIM_ARM_DEPS}/libssl.a" \
     "${SIM_ARM_DEPS}/libcrypto.a" \
-    "${SIM_ARM_DEPS}/libenv.a"
+    "${SIM_ARM_DEPS}/libenv.a" \
+    "${SIM_ARM_DEPS}/libllhttp.a"
 merge_archive "${SIM_X64_FAT}" x86_64 ios-simulator iphonesimulator \
     "${SIM_X64_DIST}/lib/libttsignal_ios.a" \
     "${SIM_X64_DEPS}/libjquic.a" \
     "${SIM_X64_DEPS}/libssl.a" \
     "${SIM_X64_DEPS}/libcrypto.a" \
-    "${SIM_X64_DEPS}/libenv.a"
+    "${SIM_X64_DEPS}/libenv.a" \
+    "${SIM_X64_DEPS}/libllhttp.a"
 
 SIM_FAT_DIR="${STAGING}/sim-fat"
 mkdir -p "${SIM_FAT_DIR}"

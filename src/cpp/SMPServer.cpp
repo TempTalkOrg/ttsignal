@@ -6,7 +6,10 @@
 #include "StdAfx.h"
 #include <time.h>
 #include <fcntl.h>
-#include <inttypes.h> // for PRI format macros
+// 用 <cinttypes> 而非 <inttypes.h>：老 glibc（arm64 交叉工具链的 sysroot）在
+// C++ 下不定义 PRI 宏，除非先 define __STDC_FORMAT_MACROS。详见 WSConnector.cpp
+// 同一处注释。
+#include <cinttypes> // for PRI format macros
 #include <openssl/rand.h> // for RAND_bytes
 #include "SMPServer.h"
 #include "Runtime.h"

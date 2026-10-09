@@ -747,6 +747,7 @@ LPCSTR bc_result2string(BCRESULT result)
 	case    BC_R_DBERROR			: return "database error";
 	case    BC_R_INVALIDPTR			: return "invalid pointer";
 	case    BC_R_INVALIDARG			: return "invalid arguments";
+	case    BC_R_NO_PHYSICAL_INTERFACE : return "no physical network interface";
 	default                         : return "out of result range";
 	}
 }

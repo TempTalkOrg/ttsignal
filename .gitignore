@@ -71,7 +71,14 @@ build/ios-*-debug/apple.dir/
 build/quictest-debug/
 ios/build/
 build/release-repo-checkout/
+build/quictest*/
+pathChange.zip
 
 # Xcode user-specific state
 **/xcuserdata/
 **/*.xcuserstate
+# Superpowers SDD scratch (ledger, briefs, review packages)
+.superpowers/
+
+# 自签测试证书含私钥，不入库；本地自行生成
+certs/

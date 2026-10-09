@@ -10,6 +10,13 @@
 // GetBestInterfaceEx has been available since Windows XP / Server 2003
 // SP1 and is the same syscall WinIpChangeMonitor already uses to track
 // the default route — see win32/WinIpChangeMonitor.cpp.
+//
+// scope_ifindex 在这里被忽略：GetBestInterfaceEx 没有"限定在某块网卡的
+// 路由表里查"这个概念，Windows 也没有对应的公开 API。查询因此始终等价于
+// scope_ifindex=0，即全局路由表。这与 IP_UNICAST_IF 的行为是匹配的——
+// Windows 上它同样不是硬绑（见 UDPSender::Connect 的平台注释：实现会强制
+// 源 IP 取自被提示的网卡，但路由仍可能落到别的出口），所以全局查询正是
+// 检出"源/路由劈叉"所需要的那个问题。
 ///////////////////////////////////////////////////////////////////////////////
 
 #include "../NetworkRouteLookup.h"
@@ -25,7 +32,8 @@
 #include <windows.h>
 
 extern "C" uint32_t tt_route_lookup_ifindex(const struct sockaddr* dst,
-                                            socklen_t /*dst_len*/)
+                                            socklen_t /*dst_len*/,
+                                            uint32_t /*scope_ifindex*/)
 {
     if (dst == NULL)
     {
@@ -52,9 +60,10 @@ extern "C" uint32_t tt_route_lookup_ifindex(const struct sockaddr* dst,
 #else  // !_WIN32
 
 extern "C" uint32_t tt_route_lookup_ifindex(const struct sockaddr* /*dst*/,
-                                            socklen_t /*dst_len*/)
+                                            socklen_t /*dst_len*/,
+                                            uint32_t /*scope_ifindex*/)
 {
-    return 0;
+    return TT_ROUTE_IFINDEX_UNKNOWN;
 }
 
 #endif  // _WIN32
