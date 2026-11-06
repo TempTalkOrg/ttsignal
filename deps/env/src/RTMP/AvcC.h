@@ -1,0 +1,96 @@
+///////////////////////////////////////////////////////////////////////////////
+// File : AvcC.h
+///////////////////////////////////////////////////////////////////////////////
+  
+#ifndef AVCC_H_INCLUDED__
+#define AVCC_H_INCLUDED__
+
+#include <BC/BCBuffer.h>
+#include <RTMP/Exports.h>
+
+using namespace BC;
+
+///////////////////////////////////////////////////////////////////////////////
+// Namespace : 
+///////////////////////////////////////////////////////////////////////////////
+
+namespace RTMP
+{
+
+///////////////////////////////////////////////////////////////////////////////
+// Macros & typedefs
+///////////////////////////////////////////////////////////////////////////////
+
+///////////////////////////////////////////////////////////////////////////////
+// Macros :
+///////////////////////////////////////////////////////////////////////////////
+
+
+///////////////////////////////////////////////////////////////////////////////
+// class : AvcC
+///////////////////////////////////////////////////////////////////////////////
+class RTMP_API AvcC
+{
+public:
+	AvcC();
+	~AvcC();
+
+	static int32_t			GetAvcC(
+								const uint8_t *data,
+								int32_t len,
+								BCBuffer &refBAOut);
+	static int32_t			ParseNalUnits(
+								const uint8_t *buf_in,
+								int32_t size,
+								BCOStream &refWriter);
+	static bool				GetSPSPPS(
+								const uint8_t *data,
+								int32_t len,
+								BCOStream &refWriter);
+	static bool				DecodeAvcC(
+								BYTE * buf, 
+								uint32_t nLen,
+								uint32_t &width,
+								uint32_t &height);
+	static BCRESULT			GetAnnexbExtradata(
+								const uint8_t *in, 
+								uint8_t **buf, 
+								int *size);
+	static bool				DecodeH264SPS(
+								BYTE * buf, 
+								uint32_t nLen,
+								uint32_t &width,
+								uint32_t &height);
+	static const uint8_t *	FindStartCode(
+								const uint8_t *p,
+								const uint8_t *end);
+
+protected:
+	static const uint8_t *	_FindStartCodeInternal(
+								const uint8_t *p,
+								const uint8_t *end);
+	static uint32_t			_ReadUe(
+								BYTE *pBuff, 
+								uint32_t nLen, 
+								uint32_t &nStartBit);
+	static int				_ReadSe(
+								BYTE *pBuff, 
+								uint32_t nLen, 
+								uint32_t &nStartBit);
+	static uint32_t			_ReadBit(
+								uint32_t BitCount,
+								BYTE * buf,
+								uint32_t &nStartBit);
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// End of namespace : RTMP
+///////////////////////////////////////////////////////////////////////////////
+
+} // End of namespace RTMP
+
+#endif // End of file AvcC.h
+
+///////////////////////////////////////////////////////////////////////////////
+// End of file : AvcC.h
+///////////////////////////////////////////////////////////////////////////////

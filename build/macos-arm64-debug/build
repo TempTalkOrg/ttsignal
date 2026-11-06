@@ -1,0 +1,11 @@
+#!/bin/bash
+
+script_dir=$(dirname $(realpath $0))
+
+cd ${script_dir}
+cp -rf ${script_dir}/../../src/js/index.js ${script_dir}/../../node_modules/ttsignal/
+cmake -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DCMAKE_OSX_ARCHITECTURES=arm64 \
+    ${script_dir}/../../src
+make -j8

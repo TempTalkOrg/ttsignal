@@ -1,0 +1,624 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="16.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="..\src\common\utils\2d_hash\xqc_2d_hash_table.c">
+      <Filter>src\common\utils\2d_hash</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\common\utils\huffman\xqc_huffman.c">
+      <Filter>src\common\utils\huffman</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\common\utils\huffman\xqc_huffman_code.c">
+      <Filter>src\common\utils\huffman</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\common\utils\vint\xqc_variable_len_int.c">
+      <Filter>src\common\utils\vint</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\common\utils\ringarray\xqc_ring_array.c">
+      <Filter>src\common\utils\ringarray</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\common\utils\ringmem\xqc_ring_mem.c">
+      <Filter>src\common\utils\rintmem</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\congestion_control\xqc_bbr.c">
+      <Filter>src\congestion_control</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\congestion_control\xqc_bbr2.c">
+      <Filter>src\congestion_control</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\congestion_control\xqc_cubic.c">
+      <Filter>src\congestion_control</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\congestion_control\xqc_new_reno.c">
+      <Filter>src\congestion_control</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\congestion_control\xqc_sample.c">
+      <Filter>src\congestion_control</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\congestion_control\xqc_window_filter.c">
+      <Filter>src\congestion_control</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\xqc_h3_conn.c">
+      <Filter>src\http3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\xqc_h3_ctx.c">
+      <Filter>src\http3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\xqc_h3_defs.c">
+      <Filter>src\http3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\xqc_h3_header.c">
+      <Filter>src\http3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\xqc_h3_request.c">
+      <Filter>src\http3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\xqc_h3_stream.c">
+      <Filter>src\http3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\frame\xqc_h3_frame.c">
+      <Filter>src\http3\frame</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\qpack\xqc_decoder.c">
+      <Filter>src\http3\qpack</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\qpack\xqc_encoder.c">
+      <Filter>src\http3\qpack</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\qpack\xqc_ins.c">
+      <Filter>src\http3\qpack</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\qpack\xqc_prefixed_int.c">
+      <Filter>src\http3\qpack</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\qpack\xqc_prefixed_str.c">
+      <Filter>src\http3\qpack</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\qpack\xqc_qpack.c">
+      <Filter>src\http3\qpack</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\qpack\dtable\xqc_dtable.c">
+      <Filter>src\http3\qpack\dtable</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\qpack\stable\xqc_stable.c">
+      <Filter>src\http3\qpack\stable</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_cid.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_client.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_conn.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_defs.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_engine.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_frame.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_frame_parser.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_pacing.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_packet.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_packet_in.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_packet_out.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_packet_parser.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_recv_record.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_stream.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_send_ctl.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_transport_params.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_utils.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\tls\xqc_crypto.c">
+      <Filter>src\tls</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\tls\xqc_hkdf.c">
+      <Filter>src\tls</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\tls\xqc_null_crypto.c">
+      <Filter>src\tls</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\common\xqc_random.c">
+      <Filter>src\common</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\common\xqc_log.c">
+      <Filter>src\common</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\common\xqc_log_event_callback.c">
+      <Filter>src\common</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\common\xqc_str.c">
+      <Filter>src\common</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\common\xqc_time.c">
+      <Filter>src\common</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\tls\xqc_tls.c">
+      <Filter>src\tls</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\tls\xqc_tls_ctx.c">
+      <Filter>src\tls</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\qpack\xqc_rep.c">
+      <Filter>src\http3\qpack</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\common\utils\var_buf\xqc_var_buf.c">
+      <Filter>src\common\utils\var_buf</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\congestion_control\xqc_copa.c">
+      <Filter>src\congestion_control</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\congestion_control\xqc_unlimited_cc.c">
+      <Filter>src\congestion_control</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\xqc_h3_ext_bytestream.c">
+      <Filter>src\http3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\http3\xqc_h3_ext_dgram.c">
+      <Filter>src\http3</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\tls\boringssl\xqc_crypto_impl.c">
+      <Filter>src\tls\boringssl</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\tls\boringssl\xqc_hkdf_impl.c">
+      <Filter>src\tls\boringssl</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\tls\boringssl\xqc_ssl_if_impl.c">
+      <Filter>src\tls\boringssl</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_datagram.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_multipath.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_quic_lb.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_reinjection.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_send_queue.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\xqc_timer.c">
+      <Filter>src\transport</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\reinjection_control\xqc_reinj_deadline.c">
+      <Filter>src\transport\reinjection_control</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\reinjection_control\xqc_reinj_default.c">
+      <Filter>src\transport\reinjection_control</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\reinjection_control\xqc_reinj_dgram.c">
+      <Filter>src\transport\reinjection_control</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\scheduler\xqc_scheduler_backup.c">
+      <Filter>src\transport\scheduler</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\scheduler\xqc_scheduler_common.c">
+      <Filter>src\transport\scheduler</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\scheduler\xqc_scheduler_interop.c">
+      <Filter>src\transport\scheduler</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\scheduler\xqc_scheduler_minrtt.c">
+      <Filter>src\transport\scheduler</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\transport\scheduler\xqc_scheduler_rap.c">
+      <Filter>src\transport\scheduler</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\common\utils\vint\xqc_discrete_int_parser.c">
+      <Filter>src\common\utils\vint</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="headers">
+      <UniqueIdentifier>{3bb94bea-ccab-44d4-957f-a6a8fb4a8adb}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src">
+      <UniqueIdentifier>{08D1F2E8-F730-3EE5-A1DE-3B9350F528CB}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\common">
+      <UniqueIdentifier>{917a924a-a2b8-48a7-b417-292f8594e359}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\congestion_control">
+      <UniqueIdentifier>{32761c2e-e94f-4542-883f-fd303a5eb782}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\http3">
+      <UniqueIdentifier>{477d5aea-b0ca-4493-9771-679146e234a4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\tls">
+      <UniqueIdentifier>{c93766f2-8f58-4617-976d-4bd2dc59dd82}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\transport">
+      <UniqueIdentifier>{2defa7cb-f580-4b44-bd10-20f69d213d5b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\common\utils">
+      <UniqueIdentifier>{d4468219-356f-46bc-86b7-b7d4ce17cb7c}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\common\utils\2d_hash">
+      <UniqueIdentifier>{9d33b3fa-c4af-4691-a46b-b49f4b70d3ac}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\common\utils\huffman">
+      <UniqueIdentifier>{ce77673b-096f-4d06-8fd0-745441f33d34}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\common\utils\ringarray">
+      <UniqueIdentifier>{27e84065-26df-4f64-b0ca-b03e07d0b966}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\common\utils\rintmem">
+      <UniqueIdentifier>{71ade88b-757a-427c-92bb-98abb4af2aa7}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\common\utils\vint">
+      <UniqueIdentifier>{e12b48cc-5375-48b1-a6ee-0f59612ae919}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\http3\frame">
+      <UniqueIdentifier>{6fdcd8b3-9a87-462e-81ec-390417d9a599}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\http3\qpack">
+      <UniqueIdentifier>{2f7a06a5-04fa-4b08-a6ce-fd8942880ee2}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\http3\qpack\dtable">
+      <UniqueIdentifier>{e3a6f571-12ca-4923-a2bc-b35515e0dd67}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\http3\qpack\stable">
+      <UniqueIdentifier>{ef560578-4e04-4d9d-bd06-33b58eb06cfd}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\tls\babassl">
+      <UniqueIdentifier>{16e5faea-74f3-4434-874c-4b6b210c7b75}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\tls\boringssl">
+      <UniqueIdentifier>{adc351f0-c671-40a4-be6f-15b2ba46ba9a}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\common\utils\var_buf">
+      <UniqueIdentifier>{38aa5874-8a8e-4b58-b098-2a0bf4ecccc4}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\transport\reinjection_control">
+      <UniqueIdentifier>{d5cfc0ba-1591-4047-b20e-871497905518}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src\transport\scheduler">
+      <UniqueIdentifier>{295755a9-ac20-471a-9b14-8179b5caaf76}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\src\common\utils\2d_hash\xqc_2d_hash_table.h">
+      <Filter>src\common\utils\2d_hash</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\utils\huffman\xqc_huffman.h">
+      <Filter>src\common\utils\huffman</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\utils\huffman\xqc_huffman_code.h">
+      <Filter>src\common\utils\huffman</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\utils\vint\xqc_variable_len_int.h">
+      <Filter>src\common\utils\vint</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\utils\ringmem\xqc_ring_mem.h">
+      <Filter>src\common\utils\rintmem</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\utils\ringarray\xqc_ring_array.h">
+      <Filter>src\common\utils\ringarray</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\congestion_control\xqc_bbr.h">
+      <Filter>src\congestion_control</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\congestion_control\xqc_bbr_common.h">
+      <Filter>src\congestion_control</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\congestion_control\xqc_bbr2.h">
+      <Filter>src\congestion_control</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\congestion_control\xqc_cubic.h">
+      <Filter>src\congestion_control</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\congestion_control\xqc_new_reno.h">
+      <Filter>src\congestion_control</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\congestion_control\xqc_sample.h">
+      <Filter>src\congestion_control</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\congestion_control\xqc_window_filter.h">
+      <Filter>src\congestion_control</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\xqc_h3_conn.h">
+      <Filter>src\http3</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\xqc_h3_ctx.h">
+      <Filter>src\http3</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\xqc_h3_defs.h">
+      <Filter>src\http3</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\xqc_h3_header.h">
+      <Filter>src\http3</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\xqc_h3_request.h">
+      <Filter>src\http3</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\xqc_h3_stream.h">
+      <Filter>src\http3</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\frame\xqc_h3_frame.h">
+      <Filter>src\http3\frame</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\frame\xqc_h3_frame_defs.h">
+      <Filter>src\http3\frame</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\qpack\xqc_decoder.h">
+      <Filter>src\http3\qpack</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\qpack\xqc_encoder.h">
+      <Filter>src\http3\qpack</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\qpack\xqc_ins.h">
+      <Filter>src\http3\qpack</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\qpack\xqc_prefixed_int.h">
+      <Filter>src\http3\qpack</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\qpack\xqc_prefixed_str.h">
+      <Filter>src\http3\qpack</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\qpack\xqc_qpack.h">
+      <Filter>src\http3\qpack</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\qpack\xqc_qpack_defs.h">
+      <Filter>src\http3\qpack</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\qpack\xqc_rep.h">
+      <Filter>src\http3\qpack</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\qpack\dtable\xqc_dtable.h">
+      <Filter>src\http3\qpack\dtable</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\qpack\stable\xqc_stable.h">
+      <Filter>src\http3\qpack\stable</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_cid.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_client.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_conn.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_defs.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_engine.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_frame.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_frame_parser.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_pacing.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_packet.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_packet_in.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_packet_out.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_packet_parser.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_recv_record.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_send_ctl.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_stream.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_transport_params.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_utils.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_wakeup_pq.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\tls\xqc_crypto.h">
+      <Filter>src\tls</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\tls\xqc_hkdf.h">
+      <Filter>src\tls</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\tls\xqc_ssl_cbs.h">
+      <Filter>src\tls</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\tls\xqc_ssl_if.h">
+      <Filter>src\tls</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\tls\xqc_tls.h">
+      <Filter>src\tls</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\tls\xqc_tls_common.h">
+      <Filter>src\tls</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\tls\xqc_tls_ctx.h">
+      <Filter>src\tls</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\tls\xqc_tls_defs.h">
+      <Filter>src\tls</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\tls\boringssl\xqc_aead_impl.h">
+      <Filter>src\tls\boringssl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_algorithm.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_array.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_buf.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_cid_hash.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_common.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_common_inc.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_config.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_fifo.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_hash.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_id_hash.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_list.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_log.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_log_event_callback.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_malloc.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_memory_pool.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_object_manager.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_priority_q.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_queue.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_random.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_rbtree.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_str.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_str_hash.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_time.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\xqc_timer.h">
+      <Filter>src\common</Filter>
+    </ClInclude>
+    <ClInclude Include="..\include\xquic\xqc_errno.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\include\xquic\xqc_http3.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\include\xquic\xquic.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\include\xquic\xquic_typedef.h">
+      <Filter>headers</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\utils\var_buf\xqc_var_buf.h">
+      <Filter>src\common\utils\var_buf</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\congestion_control\xqc_copa.h">
+      <Filter>src\congestion_control</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\congestion_control\xqc_unlimited_cc.h">
+      <Filter>src\congestion_control</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\xqc_h3_ext_bytestream.h">
+      <Filter>src\http3</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\http3\xqc_h3_ext_dgram.h">
+      <Filter>src\http3</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_datagram.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_multipath.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_reinjection.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_send_queue.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\xqc_timer.h">
+      <Filter>src\transport</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\reinjection_control\xqc_reinj_deadline.h">
+      <Filter>src\transport\reinjection_control</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\reinjection_control\xqc_reinj_default.h">
+      <Filter>src\transport\reinjection_control</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\reinjection_control\xqc_reinj_dgram.h">
+      <Filter>src\transport\reinjection_control</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\scheduler\xqc_scheduler_backup.h">
+      <Filter>src\transport\scheduler</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\scheduler\xqc_scheduler_common.h">
+      <Filter>src\transport\scheduler</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\scheduler\xqc_scheduler_interop.h">
+      <Filter>src\transport\scheduler</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\scheduler\xqc_scheduler_minrtt.h">
+      <Filter>src\transport\scheduler</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\transport\scheduler\xqc_scheduler_rap.h">
+      <Filter>src\transport\scheduler</Filter>
+    </ClInclude>
+    <ClInclude Include="..\src\common\utils\vint\xqc_discrete_int_parser.h">
+      <Filter>src\common\utils\vint</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>

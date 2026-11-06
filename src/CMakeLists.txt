@@ -1,0 +1,726 @@
+# Sets the minimum version of CMake required to build the native library.
+
+cmake_minimum_required(VERSION 3.10)
+if(POLICY CMP0048)
+  cmake_policy(SET CMP0048 NEW)
+endif()
+
+project(ttsignal)
+
+option(TARGET_PLATFORM_LINUX "Target platform is linux" OFF)
+option(BUILD_JNI "Build JNI library" OFF)
+option(BUILD_NODE_ADDON "Build Node.js addon" ON)
+option(BUILD_IOS_FRAMEWORK "Build iOS static lib + bridge for xcframework" OFF)
+
+# ---------------------------------------------------------------------------
+# Windows：静态 CRT（/MT），根治 msvcp140 版本地狱。
+#
+# 背景：VS2022 17.10 起 std::mutex 改为 constexpr 构造（对象零初始化），
+# 首次 _Mtx_lock 依赖运行时 msvcp140 ≥ 14.40 做惰性初始化。若用户机器
+# SYSTEM32 里的 MSVCP140.dll 停留在旧版（如 14.20，2019 年 vc_redist），
+# 旧 _Mtx_lock 会把零指针当作 critical section 虚表去解引用，读 0x0 触发
+# 0xC0000005，进程直接崩溃（Quicall 打开收件箱即崩的线上事故）。
+#
+# 本 .node 是 Electron/Node 进程内自包含的原生模块，不与第三方 DLL 交换
+# CRT 对象，静态 CRT 无跨模块 ABI 顾虑（Node.js 官方二进制同样静态 CRT）。
+#
+# 注意不能用 CMAKE_MSVC_RUNTIME_LIBRARY：本文件 cmake_minimum_required(3.10)
+# 把 CMP0091 钉在 OLD，该变量会被完全忽略（实测 /MD 原样进入所有编译命令）。
+# 因此直接对 4 个 CMAKE_<LANG>_FLAGS_<CONFIG> 做 /MD->/MT 替换——这是
+# CMP0091 之前 CMake 官方 Wiki 推荐、且各 deps 子项目都会继承的兼容写法。
+# 必须放在 add_subdirectory(deps/...) 之前，保证 env / jquic / llhttp /
+# boringssl 静态库与 .node 的 CRT 一致，避免 /MT 与 /MD 混用的 LNK2038。
+# ---------------------------------------------------------------------------
+if(MSVC)
+    foreach(_tt_cfg DEBUG RELEASE MINSIZEREL RELWITHDEBINFO)
+        foreach(_tt_lang C CXX)
+            if(DEFINED CMAKE_${_tt_lang}_FLAGS_${_tt_cfg})
+                string(REGEX REPLACE "(^| )/MDd?( |$)" "\\1/MT\\2"
+                       CMAKE_${_tt_lang}_FLAGS_${_tt_cfg}
+                       "${CMAKE_${_tt_lang}_FLAGS_${_tt_cfg}}")
+            endif()
+        endforeach()
+    endforeach()
+endif()
+
+if(BUILD_IOS_FRAMEWORK)
+    # iOS toolchain forces these but be defensive: don't try to build the
+    # node addon or JNI lib when targeting iOS.
+    set(BUILD_NODE_ADDON OFF CACHE BOOL "" FORCE)
+    set(BUILD_JNI        OFF CACHE BOOL "" FORCE)
+endif()
+
+if(TARGET_PLATFORM_LINUX)
+    set(TARGET_OS_LINUX TRUE)
+elseif(UNIX AND NOT APPLE)
+    set(TARGET_OS_LINUX TRUE)
+endif()
+
+set(BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+
+# 把构建机绝对路径前缀替换成相对路径，避免 __FILE__ / __builtin_FILE() / DWARF
+# 把开发者用户名（/Users/<name>/...）和仓库位置编进发行产物。
+# 必须在 add_subdirectory(deps/...) 之前调用，directory-level COMPILE_OPTIONS
+# 才会被三个 deps 子项目继承。
+#
+# 兼容性：
+#   * -ffile-prefix-map 同时影响 __FILE__ 与 DWARF 路径，需要 GCC 8+ /
+#     Clang 10+。Apple Clang (Xcode 12+) 与 Android NDK r21+ clang 都支持。
+#   * 老的 GCC 7（例如部分 brew 跨编译工具链）只认 -fdebug-prefix-map，
+#     这种情况下我们退而求其次只清理 DWARF 中的路径，__FILE__ 的字符串
+#     仍可能残留——会打 WARNING 提示升级编译器。
+#   * MSVC cl.exe：使用 /d1trimfile（VS 2019 16.4+）裁掉 __FILE__ 中的仓库根
+#     前缀；同时给出反斜杠与正斜杠两种根路径，以匹配 Ninja/MSBuild 传入的源路径。
+#     不对 clang-cl 添加该选项（请改用 -ffile-prefix-map）。
+include(CheckCCompilerFlag)
+get_filename_component(_TT_REPO_ROOT "${BASE_DIR}/.." ABSOLUTE)
+if (NOT MSVC)
+    check_c_compiler_flag("-ffile-prefix-map=/x=." TT_HAS_FFILE_PREFIX_MAP)
+    if (TT_HAS_FFILE_PREFIX_MAP)
+        add_compile_options("-ffile-prefix-map=${_TT_REPO_ROOT}=.")
+    else()
+        check_c_compiler_flag("-fdebug-prefix-map=/x=." TT_HAS_FDEBUG_PREFIX_MAP)
+        if (TT_HAS_FDEBUG_PREFIX_MAP)
+            add_compile_options("-fdebug-prefix-map=${_TT_REPO_ROOT}=.")
+        endif()
+        message(WARNING
+            "Compiler ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION} "
+            "does not support -ffile-prefix-map; absolute paths from __FILE__ "
+            "may still leak into the produced binary. Consider upgrading the "
+            "cross compiler to GCC 8+ / Clang 10+.")
+    endif()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    file(TO_NATIVE_PATH "${_TT_REPO_ROOT}" _TT_MSVC_TRIM_BS)
+    string(REGEX REPLACE "\\\\+$" "" _TT_MSVC_TRIM_BS "${_TT_MSVC_TRIM_BS}")
+    string(APPEND _TT_MSVC_TRIM_BS "\\")
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:C>:/d1trimfile:${_TT_MSVC_TRIM_BS}>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/d1trimfile:${_TT_MSVC_TRIM_BS}>"
+    )
+
+    file(TO_CMAKE_PATH "${_TT_REPO_ROOT}" _TT_MSVC_TRIM_FS)
+    string(REGEX REPLACE "/+$" "" _TT_MSVC_TRIM_FS "${_TT_MSVC_TRIM_FS}")
+    string(APPEND _TT_MSVC_TRIM_FS "/")
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:C>:/d1trimfile:${_TT_MSVC_TRIM_FS}>"
+        "$<$<COMPILE_LANGUAGE:CXX>:/d1trimfile:${_TT_MSVC_TRIM_FS}>"
+    )
+endif()
+
+add_custom_target(touch_utils ALL
+    COMMAND ${CMAKE_COMMAND} -E touch "${BASE_DIR}/cpp/Utils.cpp"
+    COMMENT "Touching Utils.cpp to update build timestamp"
+)
+
+# When building the iOS framework we link against the pre-built static
+# archives produced by ios/scripts/build-deps.sh — re-running the upstream
+# CMake projects via add_subdirectory would (a) re-trigger the boringssl Go
+# fetch every time and (b) rebuild ~5 minutes of crypto code on every core
+# iteration. Always run build-deps.sh once before this CMake step.
+if (NOT BUILD_IOS_FRAMEWORK)
+    add_subdirectory(${BASE_DIR}/../deps/env/src deps/env.dir)
+    add_subdirectory(${BASE_DIR}/../deps/boringssl/src deps/boringssl.dir)
+    add_subdirectory(${BASE_DIR}/../deps/jquic deps/jquic.dir)
+    # llhttp：HTTP 报文解析（LLHTTPParser.cpp / HttpConnector.cpp /
+    # WSConnector.cpp 的握手都要用）。iOS 分支不走这里 —— 它链的是
+    # build-deps.sh 预编的静态库，还没有 libllhttp.a，因此下面把 HTTP/WS 那四个
+    # .cpp 排除在 iOS 目标之外。
+    add_subdirectory(${BASE_DIR}/../deps/llhttp/src deps/llhttp.dir)
+endif()
+
+# __STDC_FORMAT_MACROS：和旁边的 __STDC_LIMIT_MACROS 是同一族老 ISO C99 开关。
+# 老 glibc（Linux aarch64 交叉工具链 gcc 13.3 的 sysroot）在 C++ 下把 PRIu64 等
+# PRI 宏挡在 `#if !defined __cplusplus || defined __STDC_FORMAT_MACROS` 后面，
+# 不显式请求就一个都不定义（WSConnector.cpp / SMPServer.cpp 的日志格式串要用）。
+#
+# 为什么必须在命令行上定义、光在 .cpp 里 #include <cinttypes> 不够：
+# 那些 .cpp 第一行是 #include "StdAfx.h"，它经 BC/* 早已把 <inttypes.h> 拉进来了。
+# <cinttypes> 的实现是「define __STDC_FORMAT_MACROS → include <inttypes.h> →
+# undef」，可此时 _INTTYPES_H 的 include guard 已经生效，头文件不会二次展开，
+# PRI 宏于是永远补不上。命令行 -D 在所有 include 之前生效，不受顺序影响。
+add_definitions(-D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -DHAVE_PTHREAD -DCR_USE_FALLBACKS_FOR_GCC_WITH_LIBCXX
+        -DNOMINMAX
+        -DXQC_ENABLE_BBR2
+        -DXQC_ENABLE_RENO
+        -DXQC_ENABLE_UNLIMITED
+        -DXQC_ENABLE_COPA)
+
+# Windows：BC/Config.h 在 #define WIN32_LEAN_AND_MEAN 之前就 #include <WinSock2.h>，
+# 而 WinSock2.h 会把 <windows.h> 以「非 lean」模式拉进来，wincrypt.h 随之进场。它的
+# X509_NAME / X509_EXTENSIONS / PKCS7_SIGNER_INFO 等宏会把 BoringSSL 的同名类型冲掉，
+# 后续 #include <openssl/x509v3.h> 直接报 C2143 语法错误。
+#
+# 以往只有第一行 #include "StdAfx.h" 的 .cpp 幸免——StdAfx.h 抢在 BC/Config.h 之前
+# #define 了 WIN32_LEAN_AND_MEAN。TlsContext 这类刻意不走 StdAfx.h 的独立模块就会踩中。
+# 在命令行上定义则不受 include 顺序影响，deps/jquic 走的也是 -DNOCRYPT 这条路。
+if (WIN32)
+    add_definitions(-DWIN32_LEAN_AND_MEAN -DNOCRYPT)
+endif()
+
+
+set(CMAKE_CXX_STANDARD 20)
+
+
+if(MSVC)
+    set(MSVC_DISABLED_WARNINGS_LIST
+        "C4061" # enumerator 'identifier' in switch of enum 'enumeration' is not
+                # explicitly handled by a case label
+                # Disable this because it flags even when there is a default.
+        "C4100" # 'exarg' : unreferenced formal parameter
+        "C4127" # conditional expression is constant
+        "C4200" # nonstandard extension used : zero-sized array in
+                # struct/union.
+        "C4204" # nonstandard extension used: non-constant aggregate initializer
+        "C4221" # nonstandard extension used : 'identifier' : cannot be
+                # initialized using address of automatic variable
+        "C4242" # 'function' : conversion from 'int' to 'uint8_t',
+                # possible loss of data
+        "C4244" # 'function' : conversion from 'int' to 'uint8_t',
+                # possible loss of data
+        "C4267" # conversion from 'size_t' to 'int', possible loss of data
+        "C4371" # layout of class may have changed from a previous version of the
+                # compiler due to better packing of member '...'
+        "C4388" # signed/unsigned mismatch
+        "C4296" # '>=' : expression is always true
+        "C4350" # behavior change: 'std::_Wrap_alloc...'
+        "C4365" # '=' : conversion from 'size_t' to 'int',
+                # signed/unsigned mismatch
+        "C4389" # '!=' : signed/unsigned mismatch
+        "C4464" # relative include path contains '..'
+        "C4510" # 'argument' : default constructor could not be generated
+        "C4512" # 'argument' : assignment operator could not be generated
+        "C4514" # 'function': unreferenced inline function has been removed
+        "C4548" # expression before comma has no effect; expected expression with
+                # side-effect" caused by FD_* macros.
+        "C4610" # struct 'argument' can never be instantiated - user defined
+                # constructor required.
+        "C4623" # default constructor was implicitly defined as deleted
+        "C4625" # copy constructor could not be generated because a base class
+                # copy constructor is inaccessible or deleted
+        "C4626" # assignment operator could not be generated because a base class
+                # assignment operator is inaccessible or deleted
+        "C4628" # digraphs not supported with -Ze
+        "C4668" # 'symbol' is not defined as a preprocessor macro, replacing with
+                # '0' for 'directives'
+                # Disable this because GTest uses it everywhere.
+        "C4706" # assignment within conditional expression
+        "C4710" # 'function': function not inlined
+        "C4711" # function 'function' selected for inline expansion
+        "C4800" # 'int' : forcing value to bool 'true' or 'false'
+                # (performance warning)
+        "C4820" # 'bytes' bytes padding added after construct 'member_name'
+        "C5026" # move constructor was implicitly defined as deleted
+        "C5027" # move assignment operator was implicitly defined as deleted
+        "C5045" # Compiler will insert Spectre mitigation for memory load if
+                # /Qspectre switch specified
+    )
+    set(MSVC_LEVEL4_WARNINGS_LIST
+        # See https://connect.microsoft.com/VisualStudio/feedback/details/1217660/warning-c4265-when-using-functional-header
+        "C4265" # class has virtual functions, but destructor is not virtual
+    )
+    string(REPLACE "C" " -wd" MSVC_DISABLED_WARNINGS_STR
+                            ${MSVC_DISABLED_WARNINGS_LIST})
+    string(REPLACE "C" " -w4" MSVC_LEVEL4_WARNINGS_STR
+                            ${MSVC_LEVEL4_WARNINGS_LIST})
+    set(CMAKE_C_FLAGS   "-utf-8 -EHsc ${MSVC_DISABLED_WARNINGS_STR} ${MSVC_LEVEL4_WARNINGS_STR}")
+    set(CMAKE_CXX_FLAGS "-utf-8 -EHsc ${MSVC_DISABLED_WARNINGS_STR} ${MSVC_LEVEL4_WARNINGS_STR}")
+    add_compile_options(/wd5039 /wd5204)
+else()
+    add_compile_options(-fPIC)
+    add_compile_options(-Wno-deprecated-declarations)
+    add_compile_options(-Wno-unused-label)
+    add_compile_options(-Wno-unused-parameter)
+    add_compile_options(-Wno-unused-result)
+    add_compile_options(-Wno-unused-variable)
+    add_compile_options(-Wno-unused-but-set-variable)
+    add_compile_options(-Wno-conversion-null)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
+endif()
+
+SET(LIB_NAME ttsignal )
+if(MSVC)
+    SET(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} /D_DEBUG /DDEBUG")
+    SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /D_DEBUG /DDEBUG")
+    SET(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /O2 /DNDEBUG")
+    SET(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /DNDEBUG")
+else()
+    SET(CMAKE_C_FLAGS_DEBUG "-g -Wall -D_DEBUG -DDEBUG")
+    SET(CMAKE_CXX_FLAGS_DEBUG "-g -Wall -D_DEBUG -DDEBUG")
+    SET(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O3 -DNDEBUG")
+    SET(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
+endif()
+
+
+# 添加普通 C++ 头文件路径到包含目录
+include_directories(
+    ${BASE_DIR}/../deps/env/src
+    ${BASE_DIR}/../deps/boringssl/src/include
+    ${BASE_DIR}/../deps/jquic/include
+    ${BASE_DIR}/../deps/llhttp/include
+    ${BASE_DIR}/cpp
+)
+
+if (BUILD_NODE_ADDON)
+    # 设置Node.js相关变量
+    set(NODE_JS_INCLUDE_DIR ${BASE_DIR}/../deps/node-v23.6.0/include/node)
+    set(NODE_ADDON_API_DIR ${BASE_DIR}/../deps/node-addon-api)
+    set(NODE_ADDON_SRC_DIR ${BASE_DIR}/cpp/napi)
+    include_directories(
+        ${NODE_ADDON_API_DIR}
+        ${NODE_JS_INCLUDE_DIR}
+    )
+
+    # 如果本地node目录不存在，则使用系统缓存的node-gyp头文件
+    if(NOT EXISTS ${NODE_JS_INCLUDE_DIR})
+        set(NODE_JS_INCLUDE_DIR $ENV{HOME}/Library/Caches/node-gyp/23.6.0/include/node)
+    endif()
+
+    file(GLOB NODE_ADDON_SRC_FILES
+        ${BASE_DIR}/cpp/*.cpp
+        ${BASE_DIR}/cpp/http-parser/http_parser.c
+        ${NODE_ADDON_SRC_DIR}/*.cpp
+    )
+    # ----------------------------------------------------------------------
+    # Cross-platform path-change monitor (INetworkPathMonitor):
+    #   * Apple (macOS NAPI) -> src/cpp/apple/AppleNetworkMonitor.mm
+    #   * Linux (non-Android) -> src/cpp/linux/LinuxNetlinkMonitor.cpp
+    #   * Windows -> src/cpp/win32/WinIpChangeMonitor.cpp
+    # All NAPI builds get TT_HAS_PATH_MONITOR so SMPConnector wires the
+    # monitor up at construction. Android JNI (BUILD_JNI below) deliberately
+    # does NOT define this and continues to drive Connection::Restart from
+    # the Java NetworkCallback path instead.
+    # ----------------------------------------------------------------------
+    set(TT_PATH_MONITOR_SOURCES "")
+    set(TT_PATH_MONITOR_LIBS    "")
+    if (APPLE)
+        add_subdirectory(${BASE_DIR}/cpp/apple ${CMAKE_BINARY_DIR}/apple-monitor.dir)
+        list(APPEND TT_PATH_MONITOR_SOURCES ${TT_APPLE_MONITOR_SOURCES})
+        list(APPEND TT_PATH_MONITOR_LIBS "-framework Foundation" "-framework Network")
+    elseif (WIN32)
+        add_subdirectory(${BASE_DIR}/cpp/win32 ${CMAKE_BINARY_DIR}/win32-monitor.dir)
+        list(APPEND TT_PATH_MONITOR_SOURCES ${TT_WIN32_MONITOR_SOURCES})
+        # iphlpapi.dll has NotifyIpInterfaceChange / GetBestInterfaceEx /
+        # GetIfEntry2; ws2_32 covers htonl / WSAGetLastError.
+        list(APPEND TT_PATH_MONITOR_LIBS iphlpapi ws2_32)
+    elseif (UNIX AND NOT ANDROID)
+        # Linux + any other POSIX-but-not-Android NAPI target. We still gate
+        # the source itself on __linux__ inside the .cpp.
+        add_subdirectory(${BASE_DIR}/cpp/linux ${CMAKE_BINARY_DIR}/linux-monitor.dir)
+        list(APPEND TT_PATH_MONITOR_SOURCES ${TT_LINUX_MONITOR_SOURCES})
+    endif()
+    if (TT_PATH_MONITOR_SOURCES)
+        list(APPEND NODE_ADDON_SRC_FILES ${TT_PATH_MONITOR_SOURCES})
+        add_definitions(-DTT_HAS_PATH_MONITOR=1)
+        if (APPLE)
+            # AppleNetworkMonitor.mm uses ObjC dispatch + Network.framework;
+            # ARC keeps reference counts sane without manual retain/release.
+            # Plain .cpp files (e.g. AppleRouteLookup.cpp) MUST NOT receive
+            # -fobjc-arc, otherwise clang emits an unused-arg warning that
+            # -Werror upgrades into a build failure.
+            foreach(_tt_apple_src IN LISTS TT_APPLE_MONITOR_SOURCES)
+                if (_tt_apple_src MATCHES "\\.mm$")
+                    set_source_files_properties(${_tt_apple_src}
+                        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+                endif()
+            endforeach()
+        endif()
+    endif()
+
+    # ----------------------------------------------------------------------
+    # Configure 期断言：Node addon 必须带 path monitor。
+    #
+    # 少了 TT_HAS_PATH_MONITOR，TcpChannel::_PickPhysicalIfIndex() 整段会被
+    # 条件编译掉、恒返回 0：prefer-physical（桌面默认档）静默回落系统路由，
+    # 也就是 VPN 隧道；force-physical 不会静默（TcpChannel.cpp:414-425 的硬校验
+    # 写在 guard 之外，直接 return BC_R_NO_PHYSICAL_INTERFACE=64），但整条
+    # "用真实 IP 出网" 的能力就没了。
+    #
+    # 这类缺陷极难从行为上看出来（Task 0b 白查很久），所以宁可 configure 期就
+    # 停下。运行期还有一道：__info__().hasPathMonitor —— 那一道连手搓编译命令
+    # 编出来的产物也管得到，这里的断言管不到。
+    # ----------------------------------------------------------------------
+    if (NOT TT_PATH_MONITOR_SOURCES)
+        message(FATAL_ERROR
+            "BUILD_NODE_ADDON needs the path monitor: TT_HAS_PATH_MONITOR is not "
+            "defined for this platform, so prefer-physical would silently fall "
+            "back to the system route (VPN tunnel) and force-physical would "
+            "hard-fail with BC_R_NO_PHYSICAL_INTERFACE (64).")
+    endif()
+
+    if (WIN32)
+        list(APPEND NODE_ADDON_SRC_FILES
+            ${BASE_DIR}/cpp/win32/win_delay_load_hook.c
+        )
+        add_definitions(
+            -DNODE_GYP_MODULE_NAME=ttsignal
+            -DUSING_UV_SHARED=1
+            -DUSING_V8_SHARED=1
+            -DV8_DEPRECATION_WARNINGS=1
+            -D_GLIBCXX_USE_CXX11_ABI=1
+            -DWIN32
+            -D_CRT_SECURE_NO_DEPRECATE
+            -D_CRT_NONSTDC_NO_DEPRECATE
+            -D_HAS_EXCEPTIONS=0
+            -DNOMINMAX
+            -DNAPI_DISABLE_CPP_EXCEPTIONS
+            -DBUILDING_NODE_EXTENSION
+            -DHOST_BINARY="node.exe"
+        )
+    endif()
+
+    # message(${NODE_ADDON_SRC_FILES})
+
+    add_library( # Sets the name of the library.
+            ${LIB_NAME}
+
+            # Sets the library as a shared library.
+            SHARED
+
+            # Provides a relative path to your source file(s).
+            ${NODE_ADDON_SRC_FILES})
+
+    set(EXTRA_LINK_FLAGS "")
+
+    # Node.js原生插件设置
+    if (LINUX)
+        message(STATUS "Building for Linux")
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64")
+            message(STATUS "Detected ARM64 architecture")
+            set_target_properties(${LIB_NAME} PROPERTIES PREFIX "" SUFFIX ".linux.arm64.node")
+        else()
+            message(STATUS "Detected x64 architecture")
+            set_target_properties(${LIB_NAME} PROPERTIES PREFIX "" SUFFIX ".linux.x64.node")
+        endif()
+    elseif (APPLE)
+        message(STATUS "Detected OS: macOS/iOS")
+        if (CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+            message(STATUS "Detected ARM64 architecture")
+            set_target_properties(${LIB_NAME} PROPERTIES PREFIX "" SUFFIX ".darwin.arm64.node")
+        else()
+            message(STATUS "Detected x64 architecture")
+            set_target_properties(${LIB_NAME} PROPERTIES PREFIX "" SUFFIX ".darwin.x64.node")
+        endif()
+        set(EXTRA_LINK_FLAGS "-undefined dynamic_lookup")
+    elseif (WIN32)
+        message(STATUS "Detected OS: Windows")
+        set_target_properties(${LIB_NAME} PROPERTIES PREFIX "" SUFFIX ".win32.x64.node")
+        # 检查是否使用 MinGW
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+            # MinGW 延迟加载设置
+            set(EXTRA_LINK_FLAGS "-static-libgcc -static-libstdc++ -L${BASE_DIR}/../deps/node-v23.6.0/win/x64 -lnode -lws2_32 -lkernel32 -lDbghelp -lShlwapi")
+            # 添加延迟加载支持
+            set(DELAYLOAD_LIBS "-ldelayimp")
+        else()
+            # MSVC 延迟加载设置
+            set(EXTRA_LINK_FLAGS
+                "${BASE_DIR}/../deps/node-v23.6.0/win/x64/node.lib"
+                ws2_32.lib Dbghelp.lib Shlwapi.lib Delayimp.lib
+            )
+            set(MSVC_DELAYLOAD_OPTIONS "/DELAYLOAD:node.exe")
+        endif()
+    endif()
+
+    # 检查是否是 GNU G++ 编译器
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        message(STATUS "Adding GNU/ld specific linker option: -Wl,-Bsymbolic")
+
+        # -Wl, 是告诉编译器将后面的内容作为选项传递给链接器
+        # PUBLIC/PRIVATE/INTERFACE: 决定链接选项是否会传递给依赖该目标的其他目标
+        target_link_options(${LIB_NAME} PUBLIC
+            "-Wl,-Bsymbolic"
+        )
+    endif()
+
+    add_dependencies(${LIB_NAME} touch_utils)
+
+    # 确保链接顺序正确
+    target_link_libraries( 
+        ${LIB_NAME} 
+        PRIVATE
+        env
+        jquic
+        llhttp
+        ssl
+        crypto
+        ${CMAKE_DL_LIBS}
+        ${EXTRA_LINK_FLAGS}
+    )
+    if (TT_PATH_MONITOR_LIBS)
+        target_link_libraries(${LIB_NAME} PRIVATE ${TT_PATH_MONITOR_LIBS})
+    endif()
+    if(NOT WIN32)
+        target_link_libraries(${LIB_NAME} PRIVATE pthread)
+    endif()
+    if(MSVC AND MSVC_DELAYLOAD_OPTIONS)
+        target_link_options(${LIB_NAME} PRIVATE ${MSVC_DELAYLOAD_OPTIONS})
+    endif()
+
+    set_target_properties(${LIB_NAME} PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY_DEBUG ${BASE_DIR}/../node_modules/ttsignal/dist/build/${CMAKE_BUILD_TYPE}
+        LIBRARY_OUTPUT_DIRECTORY_RELEASE ${BASE_DIR}/../node_modules/ttsignal/dist/build/${CMAKE_BUILD_TYPE}
+        RUNTIME_OUTPUT_DIRECTORY_DEBUG ${BASE_DIR}/../node_modules/ttsignal/dist/build/${CMAKE_BUILD_TYPE}
+        RUNTIME_OUTPUT_DIRECTORY_RELEASE ${BASE_DIR}/../node_modules/ttsignal/dist/build/${CMAKE_BUILD_TYPE}
+    )
+endif() # BUILD_NODE_ADDON
+
+if (BUILD_JNI)
+    # 添加 JNI 头文件路径到包含目录
+    if (TARGET_OS_LINUX)
+        include_directories(
+            ${BASE_DIR}/../deps/openjdk/linux/include
+            ${BASE_DIR}/../deps/openjdk/linux/include/linux
+        )
+    elseif (APPLE)
+        include_directories(
+            ${BASE_DIR}/../deps/openjdk/mac/include
+            ${BASE_DIR}/../deps/openjdk/mac/include/darwin
+        )
+    endif()
+
+    file(GLOB JNI_SRC_FILES
+        ${BASE_DIR}/cpp/*.cpp
+        ${BASE_DIR}/cpp/http-parser/http_parser.c
+        ${BASE_DIR}/cpp/jni/*.cpp
+    )
+    # message(${JNI_SRC_FILES})
+
+
+    add_library( # Sets the name of the library.
+            "${LIB_NAME}jni"
+
+            # Sets the library as a shared library.
+            SHARED
+
+            # Provides a relative path to your source file(s).
+            ${JNI_SRC_FILES})
+    
+    set_target_properties(${LIB_NAME}jni PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY_DEBUG ${BASE_DIR}/../out/${CMAKE_SYSTEM_NAME}/${CMAKE_BUILD_TYPE}
+        LIBRARY_OUTPUT_DIRECTORY_RELEASE ${BASE_DIR}/../out/${CMAKE_SYSTEM_NAME}/${CMAKE_BUILD_TYPE}
+    )
+
+    if (ANDROID)
+        set(EXTRA_LIBS ${EXTRA_LIBS} -llog -landroid ${EXTRA_LIBS})
+        set_target_properties(${LIB_NAME}jni PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY_DEBUG ${BASE_DIR}/../out/${CMAKE_SYSTEM_NAME}/${CMAKE_BUILD_TYPE}/${ANDROID_ABI}
+            LIBRARY_OUTPUT_DIRECTORY_RELEASE ${BASE_DIR}/../out/${CMAKE_SYSTEM_NAME}/${CMAKE_BUILD_TYPE}/${ANDROID_ABI}
+        )
+    else()
+        set(EXTRA_LIBS ${EXTRA_LIBS} -lpthread ${EXTRA_LIBS})
+        set_target_properties(${LIB_NAME}jni PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY_DEBUG ${BASE_DIR}/../out/${CMAKE_SYSTEM_NAME}/${CMAKE_BUILD_TYPE}
+            LIBRARY_OUTPUT_DIRECTORY_RELEASE ${BASE_DIR}/../out/${CMAKE_SYSTEM_NAME}/${CMAKE_BUILD_TYPE}
+        )
+    endif()
+    add_dependencies(${LIB_NAME}jni touch_utils)
+
+    target_link_libraries( 
+        ${LIB_NAME}jni
+        PRIVATE
+        env
+        jquic
+        llhttp
+        ssl
+        crypto
+        ${EXTRA_LIBS}
+        ${CMAKE_DL_LIBS}
+    )
+
+    file(GLOB JAVA_SRC_FILES
+        ${BASE_DIR}/java/org/example/android/smp/*.java
+    )
+
+    find_package(Java REQUIRED)
+
+    include(UseJava)
+
+    set(CMAKE_JAVA_COMPILE_FLAGS "-source" "11" "-target" "11")
+
+    add_jar(signal
+            MANIFEST ${BASE_DIR}/java/MANIFEST.MF
+            ${JAVA_SRC_FILES}
+            OUTPUT_DIR ${BASE_DIR}/../out/${CMAKE_SYSTEM_NAME}/${CMAKE_BUILD_TYPE})
+endif()
+
+if (BUILD_IOS_FRAMEWORK)
+    # Pull in the Apple monitor + iOS Swift bridge sources / public headers /
+    # module map (TT_APPLE_MONITOR_* + TT_IOS_BRIDGE_*).
+    add_subdirectory(${BASE_DIR}/cpp/apple ${CMAKE_BINARY_DIR}/apple.dir)
+
+    # Caller (build-core.sh) is expected to pass IOS_DEPS_DIR pointing at
+    # build/ios-deps/<sdk>-<arch>/lib, where build-deps.sh has dropped the
+    # pre-built libssl / libcrypto / libjquic / libenv archives. If not
+    # supplied, fall back to the conventional layout.
+    if (NOT IOS_DEPS_DIR)
+        # Reconstruct from CMAKE_OSX_SYSROOT + CMAKE_SYSTEM_PROCESSOR.
+        get_filename_component(_sdk_basename "${CMAKE_OSX_SYSROOT}" NAME)
+        # SDK path looks like .../iPhoneOS18.5.sdk — strip version + .sdk to get sdk name
+        string(REGEX REPLACE "([A-Za-z]+)[0-9.]*\\.sdk$" "\\1" _sdk_name "${_sdk_basename}")
+        string(TOLOWER "${_sdk_name}" _sdk_name_lc)
+        set(IOS_DEPS_DIR "${BASE_DIR}/../build/ios-deps/${_sdk_name_lc}-${CMAKE_SYSTEM_PROCESSOR}/lib")
+    endif()
+    if (NOT EXISTS "${IOS_DEPS_DIR}/libssl.a")
+        message(FATAL_ERROR
+            "BUILD_IOS_FRAMEWORK requires pre-built deps. Expected libssl.a "
+            "under ${IOS_DEPS_DIR}. Run ios/scripts/build-deps.sh first.")
+    endif()
+    message(STATUS "ttsignal_ios: deps from ${IOS_DEPS_DIR}")
+
+    file(GLOB TT_IOS_CORE_SRC
+        ${BASE_DIR}/cpp/*.cpp
+        ${BASE_DIR}/cpp/http-parser/http_parser.c
+    )
+    # HttpConnector / LLHTTPParser / WSConnector / WSParser 这四个依赖 llhttp 的
+    # 文件曾经在这里被 REMOVE_ITEM 掉 —— 那时 ios/scripts/build-deps.sh 只编
+    # boringssl / env / jquic，build/ios-deps/<sdk>-<arch>/lib/ 下没有
+    # libllhttp.a，不排除就会在链接期报 llhttp_init / llhttp_execute 一串
+    # undefined symbol，于是 iOS 侧没有 HTTP/WS 能力。
+    # 现在 build-deps.sh 已经照 env 的写法把 llhttp 也编成三 slice 静态库
+    # （纯 C，三个 .c，无外部依赖），下面也链上了 ${IOS_DEPS_DIR}/libllhttp.a，
+    # 因此四个文件正常参与编译，iOS 与 Android / Node 的能力面对齐。
+
+    add_library(ttsignal_ios STATIC
+        ${TT_IOS_CORE_SRC}
+        ${TT_APPLE_MONITOR_SOURCES}
+        ${TT_IOS_BRIDGE_SOURCES}
+    )
+    add_dependencies(ttsignal_ios touch_utils)
+
+    # Tell SMPConnector to link against tt_netmon_* — same flag used by
+    # macOS / Linux / Windows NAPI builds so the runtime path is identical.
+    target_compile_definitions(ttsignal_ios PRIVATE TT_HAS_PATH_MONITOR=1)
+
+    target_include_directories(ttsignal_ios PUBLIC
+        ${BASE_DIR}/cpp
+        ${BASE_DIR}/cpp/apple
+        ${BASE_DIR}/../deps/env/src
+        ${BASE_DIR}/../deps/boringssl/src/include
+        ${BASE_DIR}/../deps/jquic/include
+        ${BASE_DIR}/../deps/llhttp/include
+    )
+
+    # ARC for the .mm bridge files. Plain .cpp/.c files get compiled the
+    # normal way (no ObjC runtime). We must filter manually because
+    # TT_APPLE_MONITOR_SOURCES now also contains AppleRouteLookup.cpp,
+    # which is plain C++.
+    foreach(_tt_ios_src IN LISTS TT_APPLE_MONITOR_SOURCES TT_IOS_BRIDGE_SOURCES)
+        if (_tt_ios_src MATCHES "\\.mm$")
+            set_source_files_properties(${_tt_ios_src}
+                PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        endif()
+    endforeach()
+
+    # Link against pre-built static archives.
+    target_link_libraries(ttsignal_ios PRIVATE
+        ${IOS_DEPS_DIR}/libenv.a
+        ${IOS_DEPS_DIR}/libjquic.a
+        ${IOS_DEPS_DIR}/libllhttp.a
+        ${IOS_DEPS_DIR}/libssl.a
+        ${IOS_DEPS_DIR}/libcrypto.a
+    )
+
+    # Apple system frameworks needed by AppleNetworkMonitor / ios_logger.
+    target_link_libraries(ttsignal_ios PRIVATE
+        "-framework Foundation"
+        "-framework Network"
+    )
+
+    # Position-independent code & C++ standard floor for the iOS build.
+    set_target_properties(ttsignal_ios PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        OUTPUT_NAME "ttsignal_ios"
+        ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
+    )
+
+    # Stage the public headers + module.modulemap next to the .a so the
+    # ios/scripts/build-xcframework.sh helper can pick them up without
+    # having to reach into src/cpp/apple/ across slices.
+    set(_TT_IOS_STAGE ${CMAKE_BINARY_DIR}/stage)
+    file(MAKE_DIRECTORY ${_TT_IOS_STAGE}/Headers ${_TT_IOS_STAGE}/Modules)
+    foreach(_h ${TT_APPLE_MONITOR_PUBLIC_HEADERS} ${TT_IOS_BRIDGE_PUBLIC_HEADERS})
+        get_filename_component(_hn ${_h} NAME)
+        configure_file(${_h} ${_TT_IOS_STAGE}/Headers/${_hn} COPYONLY)
+    endforeach()
+    configure_file(${TT_IOS_BRIDGE_MODULEMAP}
+                   ${_TT_IOS_STAGE}/Modules/module.modulemap COPYONLY)
+
+    message(STATUS "ttsignal: iOS framework bits staged at ${_TT_IOS_STAGE}")
+endif() # BUILD_IOS_FRAMEWORK
+# ---------------------------------------------------------------------------
+# 命令行验证工具（tools/httpget）。默认关闭，不进任何发行产物。
+#   cmake ../src -DBUILD_NODE_ADDON=ON -DBUILD_TOOLS=ON && make httpget
+# 必须放在文件末尾：tools/CMakeLists.txt 要用上面算好的 TT_PATH_MONITOR_*
+# 变量，也要继承 BUILD_NODE_ADDON 分支里 add_definitions 的 TT_HAS_PATH_MONITOR。
+# ---------------------------------------------------------------------------
+option(BUILD_TOOLS "Build command-line verification tools" OFF)
+if(BUILD_TOOLS)
+    if(BUILD_IOS_FRAMEWORK)
+        message(FATAL_ERROR "BUILD_TOOLS 与 BUILD_IOS_FRAMEWORK 不能同时开启")
+    endif()
+    add_subdirectory(${BASE_DIR}/../tools tools.dir)
+endif()
+
+# ---------------------------------------------------------------------------
+# 主机端测试（释放路径 / 泄漏回归）。默认关闭，不进任何发行产物。
+#   cmake -S src -B build/tests-debug -DCMAKE_BUILD_TYPE=Debug -DBUILD_NODE_ADDON=ON -DBUILD_TESTS=ON
+#   cmake --build build/tests-debug --target udpsendergroup_release_test capi_connect_stub_release_test
+# 测试与 Node addon 用同一套编译选项（add_definitions、TT_HAS_PATH_MONITOR、
+# deps 静态库），避免手工命令行与 libenv 的结构体布局不一致（BCSocket.h INSIST）。
+# ASan：加 -DCMAKE_CXX_FLAGS=-fsanitize=address 等，并换一个 CMAKE_BUILD_TYPE（如
+# RelWithDebInfo）——deps 的 .a 按 build type 落到 deps/*/lib/<平台>/<type>/，
+# 与 Debug 共用路径会互相覆盖，链接时报 ___asan_* 未定义。
+# 依赖 BUILD_NODE_ADDON 分支算好的 TT_PATH_MONITOR_*，所以和 BUILD_TOOLS 一样放在文件末尾。
+# ---------------------------------------------------------------------------
+option(BUILD_TESTS "Build host-side release-path tests" OFF)
+if(BUILD_TESTS)
+    if(NOT BUILD_NODE_ADDON OR BUILD_IOS_FRAMEWORK)
+        message(FATAL_ERROR "BUILD_TESTS 需要 BUILD_NODE_ADDON=ON 且不能与 BUILD_IOS_FRAMEWORK 同时开启")
+    endif()
+
+    # 核心源码：同 Node addon，去掉 N-API 绑定
+    file(GLOB TT_TEST_CORE_SRC
+        ${BASE_DIR}/cpp/*.cpp
+        ${BASE_DIR}/cpp/http-parser/http_parser.c
+    )
+    list(APPEND TT_TEST_CORE_SRC ${TT_PATH_MONITOR_SOURCES})
+    # C ABI（tt_*）在 ios_bridge.mm / ios_http_bridge.mm（ios_logger.mm 是日志后端），只在 Apple 主机上能编
+    if (APPLE)
+        list(APPEND TT_TEST_CORE_SRC ${TT_IOS_BRIDGE_SOURCES})
+        set_source_files_properties(${TT_IOS_BRIDGE_SOURCES} PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    endif()
+
+    add_library(ttsignal_test_core STATIC ${TT_TEST_CORE_SRC})
+    add_dependencies(ttsignal_test_core touch_utils)
+    target_include_directories(ttsignal_test_core PUBLIC
+        ${BASE_DIR}/cpp
+        ${BASE_DIR}/cpp/apple
+        ${BASE_DIR}/../deps/env/src
+        ${BASE_DIR}/../deps/boringssl/src/include
+        ${BASE_DIR}/../deps/jquic/include
+        ${BASE_DIR}/../deps/llhttp/include
+    )
+    target_link_libraries(ttsignal_test_core PUBLIC env jquic llhttp ssl crypto ${CMAKE_DL_LIBS})
+    if (TT_PATH_MONITOR_LIBS)
+        target_link_libraries(ttsignal_test_core PUBLIC ${TT_PATH_MONITOR_LIBS})
+    endif()
+    if (NOT WIN32)
+        target_link_libraries(ttsignal_test_core PUBLIC pthread)
+    endif()
+
+    set(TT_TESTS udpsendergroup_release_test)
+    # UDPSenderGroup 两条释放路径不漏 sender（见测试文件头）
+    add_executable(udpsendergroup_release_test ${BASE_DIR}/cpp/tests/UDPSenderGroupRelease_test.cpp)
+    if (APPLE)
+        # C ABI 的 connect stub 在结果交付后释放（见测试文件头）
+        add_executable(capi_connect_stub_release_test ${BASE_DIR}/cpp/tests/CapiConnectStubRelease_test.cpp)
+        list(APPEND TT_TESTS capi_connect_stub_release_test)
+    endif()
+    foreach(_tt_test IN LISTS TT_TESTS)
+        target_link_libraries(${_tt_test} PRIVATE ttsignal_test_core)
+        set_target_properties(${_tt_test} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        )
+    endforeach()
+endif()

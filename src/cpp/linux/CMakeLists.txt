@@ -1,0 +1,25 @@
+# Linux-only network path monitor (NETLINK_ROUTE).
+# Pulled in by src/CMakeLists.txt only when BUILD_NODE_ADDON=ON on a
+# non-Android Linux target.
+
+cmake_minimum_required(VERSION 3.10)
+
+set(TT_LINUX_MONITOR_SRC
+    ${CMAKE_CURRENT_SOURCE_DIR}/LinuxNetlinkMonitor.cpp
+    # Kernel route-table query helper. Implements tt_route_lookup_ifindex
+    # declared in src/cpp/NetworkRouteLookup.h. UDPSender uses it on the
+    # Linux non-Android NAPI build to validate IP_UNICAST_IF hints.
+    ${CMAKE_CURRENT_SOURCE_DIR}/LinuxRouteLookup.cpp
+    # 物理网卡判定（/sys/class/net/<name>/device）。LinuxNetlinkMonitor 在
+    # prefer-physical / force-physical 策略下用它过滤 VPN 隧道与虚拟网桥。
+    ${CMAKE_CURRENT_SOURCE_DIR}/LinuxPhysicalIface.cpp
+)
+
+set(TT_LINUX_MONITOR_HEADERS
+    ${CMAKE_CURRENT_SOURCE_DIR}/LinuxNetlinkMonitor.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/LinuxPhysicalIface.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../NetworkRouteLookup.h
+)
+
+set(TT_LINUX_MONITOR_SOURCES        ${TT_LINUX_MONITOR_SRC}     PARENT_SCOPE)
+set(TT_LINUX_MONITOR_PUBLIC_HEADERS ${TT_LINUX_MONITOR_HEADERS} PARENT_SCOPE)
